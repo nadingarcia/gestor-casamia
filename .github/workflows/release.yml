@@ -30,3 +30,10 @@ jobs:
           # Token automático do Actions: publica a release neste mesmo repositório
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: npm run build && npx electron-builder --win --publish always
+
+      # O electron-builder cria a release como rascunho quando publica com o
+      # token do Actions; aqui ela fica pública para o painel e o auto-update.
+      - name: Publicar release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "${{ github.ref_name }}" --draft=false --latest --repo "${{ github.repository }}"
