@@ -1,0 +1,4722 @@
+import {
+  useState,
+  useEffect,
+  useMemo,
+  useRef,
+  useCallback,
+  createContext,
+  useContext,
+} from 'react'
+import { useNavigate } from 'react-router-dom'
+import electronAPI from '@utils/electronBridge'
+import { useOrderClustering } from '@hooks/useOrderClustering'
+import { ClusterFloatingCard } from '../components/ClusterFloatingCard'
+import { clearSession } from '../utils/apiFetch'
+import {
+  atualizarStatus,
+  buscarPedido,
+  cancelarPedido,
+  confirmarPagamento,
+  listarPedidosDoDia,
+  verificarPagamentoPix,
+} from '../utils/casaMiaApi'
+import { RESTAURANTE } from '../config'
+import { PEDIDO_TESTE_IMPRESSAO } from '../components/PedidoTeste'
+import packageInfo from '../../package.json'
+import notificationSoundUrl from '../assets/notification.mp3'
+import {
+  TIPO_PEDIDO_BALCAO,
+  TIPO_PEDIDO_DELIVERY,
+  TIPO_PEDIDO_TODOS,
+  getTipoPedidoLabel,
+  isDelivery,
+  normalizeTipoPedido,
+} from '@utils/orderType'
+import {
+  ANTECEDENCIA_PREPARO_MIN,
+  getInicioContagem,
+  getPrazoMinutos,
+  isAgendado,
+  isAguardandoHorario,
+} from '@utils/agendamento'
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SINGLETONS DE MÓDULO
+// Criados uma única vez quando o bundle carrega.
+// Sobrevivem a remounts do componente — evitam dupla impressão e dupla chamada
+// à Box Delivery mesmo que React desmonte e remonte (StrictMode, troca de rota).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Set global de IDs já processados (aceitos/impressos) — persiste entre remounts */
+const globalProcessedIds = new Set()
+
+/** IDs de pedidos "Recebido" que já tocaram o aviso de novo pedido */
+const globalAnnouncedIds = new Set()
+
+/**
+ * Instância única do áudio de notificação.
+ * preload="auto" faz o browser baixar o arquivo imediatamente,
+ * eliminando o delay na primeira notificação.
+ */
+const notificationAudio = new Audio(notificationSoundUrl)
+notificationAudio.preload = 'auto'
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CACHE LOCAL DE PEDIDOS
+// Elimina a tela em branco no mount e mantém operação durante quedas de API.
+// Dados com mais de 8h são descartados — evita exibir pedidos de ontem.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const CACHE_KEY = 'casamia_pedidos_cache'
+const CACHE_MAX_AGE_MS = 8 * 60 * 60 * 1000 // 8 horas
+const PRINT_STATUS_KEY = 'casamia_order_print_status'
+const ORDER_REFRESH_SECONDS = 10
+// O painel web aceita sozinho todo pedido "Enviado" quando está aberto, então
+// um pedido pode aparecer aqui já "Em preparação". Se chegou há pouco e nunca
+// foi impresso, o gestor ainda trata como novo (som, aviso e impressão).
+const JANELA_PEDIDO_NOVO_MS = 20 * 60 * 1000
+
+// Pix online parado em "Aguardando Pagamento": o gestor pergunta ao Mercado
+// Pago de tempos em tempos, caso o webhook não tenha chegado. Depois de
+// PIX_VERIFICACAO_JANELA_MS desiste (o painel também para de tentar).
+const PIX_VERIFICACAO_INTERVALO_MS = 60 * 1000
+const PIX_VERIFICACAO_JANELA_MS = 90 * 60 * 1000
+
+const readPedidosCache = () => {
+  try {
+    const raw = localStorage.getItem(CACHE_KEY)
+    if (!raw) return null
+    const { timestamp, data } = JSON.parse(raw)
+    if (Date.now() - timestamp > CACHE_MAX_AGE_MS) {
+      localStorage.removeItem(CACHE_KEY)
+      return null
+    }
+    return data
+  } catch {
+    return null
+  }
+}
+
+const writePedidosCache = (data) => {
+  try {
+    localStorage.setItem(CACHE_KEY, JSON.stringify({
+      timestamp: Date.now(),
+      data,
+    }))
+  } catch {} // quota exceeded — silencioso
+}
+
+const readPrintStatuses = () => {
+  try {
+    return JSON.parse(localStorage.getItem(PRINT_STATUS_KEY) || '{}')
+  } catch {
+    return {}
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// UTILITÁRIOS DE FORMATAÇÃO
+// ─────────────────────────────────────────────────────────────────────────────
+
+const formatCurrency = (val) =>
+  new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' }).format(
+    val || 0
+  )
+
+const formatTime = (dateStr) => {
+  if (!dateStr) return '--:--'
+  return new Date(dateStr).toLocaleTimeString('pt-BR', {
+    hour: '2-digit',
+    minute: '2-digit',
+  })
+}
+
+const formatDate = (dateStr) => {
+  if (!dateStr) return ''
+  return new Date(dateStr).toLocaleDateString('pt-BR')
+}
+
+const getOrderNumber = (pedido) =>
+  pedido?.numeroPedido || pedido?._id?.slice(-4).toUpperCase() || '----'
+
+const escapeHtml = (value = '') =>
+  String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#039;')
+
+const DISCOUNT_LABELS = {
+  CASHBACK: 'Cashback',
+  DESCONTO_PERCENTUAL: 'Desconto percentual',
+  PRIMEIRA_COMPRA: 'Primeira compra',
+  MINIJOGO: 'Minijogo',
+  MINI_JOGO: 'Minijogo',
+  'MINI-GAME': 'Minijogo',
+  MINIGAME: 'Minijogo',
+  CAMPANHA: 'Campanha',
+  COMBINADO: 'Desconto combinado',
+}
+
+const getDiscountInfo = (pedido) => {
+  if (!pedido || Number(pedido.desconto || 0) <= 0) return null
+
+  const origem = String(pedido.origemDesconto || '').trim().toUpperCase()
+  const campanhaNome = String(pedido.campanha?.nome || '').trim()
+  const campanhaPercentual = Number(pedido.campanha?.valorDesconto || 0)
+
+  if (campanhaNome) {
+    const campaignLabel = campanhaPercentual > 0
+      ? `Campanha: ${campanhaNome} (${campanhaPercentual}% OFF)`
+      : `Campanha: ${campanhaNome}`
+
+    return {
+      label: origem === 'COMBINADO' ? `${campaignLabel} + Cashback` : campaignLabel,
+      shortLabel: campanhaNome,
+      isCampaign: true,
+    }
+  }
+
+  const percentual = Number(pedido.descontoPercentual || 0)
+  const label = origem === 'DESCONTO_PERCENTUAL' && percentual > 0
+    ? `Desconto de ${percentual}%`
+    : DISCOUNT_LABELS[origem] || 'Desconto'
+  return { label, shortLabel: label, isCampaign: false }
+}
+
+const hasOrderObservation = (pedido) =>
+  Boolean(String(pedido?.observacao || pedido?.observacoes || '').trim()) ||
+  (pedido?.itens || []).some((item) =>
+    String(item?.observacao || item?.observacoes || item?.obs || '').trim()
+  )
+
+const getPaymentInfo = (pedido) => {
+  const method = String(pedido?.formaPagamento || '').toLowerCase()
+  const status = String(pedido?.statusPagamento || '').toLowerCase()
+  const total = Number(pedido?.total || 0)
+  const isOnline =
+    Boolean(pedido?.pagamentoOnline) ||
+    ['online_card', 'online_pix', 'pix_online', 'mercadopago'].includes(method)
+
+  if (isOnline && ['approved', 'aprovado', 'pago'].includes(status)) {
+    return {
+      label: 'PAGO ONLINE',
+      shortLabel: 'PAGO ONLINE',
+      className: 'bg-emerald-50 text-emerald-700 border-emerald-200',
+      icon: 'fa-circle-check',
+    }
+  }
+
+  if (isOnline && ['refused', 'recusado', 'rejeitado'].includes(status)) {
+    return {
+      label: 'PAGAMENTO RECUSADO',
+      shortLabel: 'RECUSADO',
+      className: 'bg-red-50 text-red-700 border-red-200',
+      icon: 'fa-circle-xmark',
+    }
+  }
+
+  if (isOnline) {
+    return {
+      label: 'PAGAMENTO PENDENTE',
+      shortLabel: 'PAG. PENDENTE',
+      className: 'bg-amber-50 text-amber-700 border-amber-200',
+      icon: 'fa-clock',
+    }
+  }
+
+  if (method === 'dinheiro' && Number(pedido?.trocoPara) > 0) {
+    return {
+      label: `DINHEIRO · TROCO R$ ${Number(pedido.trocoPara).toFixed(2).replace('.', ',')}`,
+      shortLabel: `TROCO R$ ${Number(pedido.trocoPara).toFixed(2).replace('.', ',')}`,
+      className: 'bg-blue-50 text-blue-700 border-blue-200',
+      icon: 'fa-money-bill-wave',
+    }
+  }
+
+  const methodLabel = {
+    dinheiro: 'DINHEIRO',
+    pix: 'PIX',
+    pix_presencial: 'PIX NA ENTREGA',
+    cartao: 'CARTÃO',
+    credito: 'CRÉDITO',
+    debito: 'DÉBITO',
+    debito_maq: 'MAQUININHA',
+    refeicao_maq: 'VALE-REFEIÇÃO',
+    na_entrega: 'NA ENTREGA',
+  }[method]
+
+  return {
+    label: `COBRAR R$ ${total.toFixed(2).replace('.', ',')}${methodLabel ? ` · ${methodLabel}` : ''}`,
+    shortLabel: methodLabel || 'COBRAR',
+    className: 'bg-slate-50 text-slate-700 border-slate-200',
+    icon: 'fa-wallet',
+  }
+}
+
+const getTimeElapsed = (dateStr, now = Date.now()) => {
+  if (!dateStr) return { minutes: 0, isUrgent: false }
+  const minutes = Math.floor((now - new Date(dateStr)) / 60000)
+  return { minutes, isUrgent: minutes > 30 }
+}
+
+/**
+ * Mapeia o status atual para o próximo na esteira do Kanban.
+ * Centralizado aqui para evitar lógica duplicada em advanceStatus e OrderCard.
+ */
+const getNextStatus = (currentStatus) => {
+  const map = {
+    Recebido: 'Em preparação',
+    'Em preparação': 'Saiu para entrega',
+    'Saiu para entrega': 'Entregue',
+  }
+  return map[currentStatus] || null
+}
+
+const getOrderAction = (pedido) => {
+  const delivery = isDelivery(pedido)
+
+  const actions = {
+    Recebido: {
+      label: 'Aceitar pedido',
+      shortLabel: 'ACEITAR',
+      loadingLabel: 'Aceitando...',
+      successLabel: 'Pedido aceito e enviado para preparação.',
+      icon: 'fa-check',
+    },
+    'Em preparação': delivery
+      ? {
+          label: 'Enviar para entrega',
+          shortLabel: 'ENVIAR',
+          loadingLabel: 'Enviando...',
+          successLabel: 'Pedido enviado para entrega.',
+          icon: 'fa-motorcycle',
+        }
+      : {
+          label: 'Liberar para retirada',
+          shortLabel: 'LIBERAR',
+          loadingLabel: 'Liberando...',
+          successLabel: 'Pedido liberado para retirada.',
+          icon: 'fa-shopping-bag',
+        },
+    'Saiu para entrega': delivery
+      ? {
+          label: 'Marcar como entregue',
+          shortLabel: 'ENTREGUE',
+          loadingLabel: 'Finalizando...',
+          successLabel: 'Pedido marcado como entregue.',
+          icon: 'fa-check-circle',
+        }
+      : {
+          label: 'Marcar como retirado',
+          shortLabel: 'RETIRADO',
+          loadingLabel: 'Finalizando...',
+          successLabel: 'Pedido marcado como retirado.',
+          icon: 'fa-check-circle',
+        },
+  }
+
+  return actions[pedido?.status] || null
+}
+
+const getPrintStatusInfo = (printStatus) => {
+  const status = printStatus?.status || 'not_printed'
+  const options = {
+    printing: {
+      label: 'Imprimindo...',
+      shortLabel: 'IMPRIMINDO',
+      icon: 'fa-spinner fa-spin',
+      className: 'bg-violet-50 border-violet-200 text-violet-700',
+    },
+    not_printed: {
+      label: 'Não impresso',
+      shortLabel: 'NÃO IMP.',
+      icon: 'fa-print',
+      className: 'bg-gray-50 border-gray-200 text-gray-500',
+    },
+    printed_auto: {
+      label: 'Impresso automaticamente',
+      shortLabel: 'IMPRESSO',
+      icon: 'fa-check',
+      className: 'bg-emerald-50 border-emerald-200 text-emerald-700',
+    },
+    printed_manual: {
+      label: 'Impresso',
+      shortLabel: 'IMPRESSO',
+      icon: 'fa-check',
+      className: 'bg-emerald-50 border-emerald-200 text-emerald-700',
+    },
+    reprinted: {
+      label: `Reimpresso${printStatus?.count > 1 ? ` ${printStatus.count}x` : ''}`,
+      shortLabel: `REIMP.${printStatus?.count > 1 ? ` ${printStatus.count}x` : ''}`,
+      icon: 'fa-copy',
+      className: 'bg-blue-50 border-blue-200 text-blue-700',
+    },
+    failed: {
+      label: 'Falha na impressão',
+      shortLabel: 'FALHA IMP.',
+      icon: 'fa-triangle-exclamation',
+      className: 'bg-red-50 border-red-200 text-red-700',
+    },
+  }
+
+  return options[status] || options.not_printed
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TICK CONTEXT — timer global único para todos os countdowns
+//
+// Problema anterior: cada OrderCard rodava seu próprio setInterval(1s).
+// Com 30 cards ativos = 30 timers simultâneos no thread principal.
+//
+// Solução: 1 único Context que bate a cada segundo. Cada card apenas lê
+// o valor — zero timers próprios. Redução de ~96% nos intervalos ativos.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const TickContext = createContext(Date.now())
+
+function TickProvider({ children }) {
+  const [tick, setTick] = useState(Date.now())
+
+  useEffect(() => {
+    const id = setInterval(() => setTick(Date.now()), 1000)
+    return () => clearInterval(id)
+  }, [])
+
+  return <TickContext.Provider value={tick}>{children}</TickContext.Provider>
+}
+
+const useTick = () => useContext(TickContext)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HOOK: useCountdown
+// Calcula tempo restante a partir do tick global — sem setInterval próprio.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function useCountdown(createdAt, estimatedMinutes = 40) {
+  const now = useTick()
+  const elapsedSecs = Math.floor((now - new Date(createdAt)) / 1000)
+  const totalSecs = estimatedMinutes * 60
+  const remaining = Math.max(0, totalSecs - elapsedSecs)
+  const overdueSecs = remaining === 0 ? Math.max(0, elapsedSecs - totalSecs) : 0
+
+  const mins = String(Math.floor(remaining / 60)).padStart(2, '0')
+  const secs = String(remaining % 60).padStart(2, '0')
+
+  return {
+    display: `${mins}:${secs}`,
+    isLate: remaining === 0,
+    isWarning: remaining > 0 && remaining < 600, // menos de 10 min
+    overdueMinutes: Math.floor(overdueSecs / 60),
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HOOK: useFocusTrap
+// Prende o foco dentro de um container enquanto isActive=true.
+// WCAG 2.1 critério 2.4.3 (Focus Order) — obrigatório em modais.
+// Restaura o foco no elemento que estava ativo antes de abrir o modal.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function useFocusTrap(isActive, onEscape) {
+  const containerRef = useRef(null)
+
+  useEffect(() => {
+    if (!isActive || !containerRef.current) return
+
+    const focusable = Array.from(
+      containerRef.current.querySelectorAll(
+        'button:not([disabled]), [href], input:not([disabled]), ' +
+          'select:not([disabled]), textarea:not([disabled]), ' +
+          '[tabindex]:not([tabindex="-1"])'
+      )
+    )
+    const first = focusable[0]
+    const last = focusable[focusable.length - 1]
+    const previouslyFocused = document.activeElement
+
+    // setTimeout 0 garante que o foco só mova após o DOM estar pintado
+    const focusTimer = setTimeout(() => first?.focus(), 0)
+
+    const handleKeyDown = (e) => {
+      if (e.key === 'Escape') {
+        onEscape?.()
+        return
+      }
+      if (e.key !== 'Tab') return
+      if (e.shiftKey) {
+        if (document.activeElement === first) {
+          e.preventDefault()
+          last?.focus()
+        }
+      } else {
+        if (document.activeElement === last) {
+          e.preventDefault()
+          first?.focus()
+        }
+      }
+    }
+
+    document.addEventListener('keydown', handleKeyDown)
+
+    return () => {
+      clearTimeout(focusTimer)
+      document.removeEventListener('keydown', handleKeyDown)
+      // Devolve foco ao elemento que estava ativo antes de abrir o modal
+      previouslyFocused?.focus()
+    }
+  }, [isActive, onEscape])
+
+  return containerRef
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// HOOK: useOnlineStatus
+// Monitora conexão via eventos nativos do browser.
+// Quando volta online, dispara callback opcional (ex: refetch automático).
+// ─────────────────────────────────────────────────────────────────────────────
+
+function useOnlineStatus() {
+  const [isOnline, setIsOnline] = useState(navigator.onLine)
+  const wasOffline = useRef(false)
+
+  useEffect(() => {
+    const handleOnline  = () => { setIsOnline(true);  wasOffline.current = false }
+    const handleOffline = () => { setIsOnline(false); wasOffline.current = true  }
+    window.addEventListener('online',  handleOnline)
+    window.addEventListener('offline', handleOffline)
+    return () => {
+      window.removeEventListener('online',  handleOnline)
+      window.removeEventListener('offline', handleOffline)
+    }
+  }, [])
+
+  return { isOnline, wasOffline }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
+function useRestaurantConfig() {
+  return useMemo(() => {
+    const cnpjRaw = localStorage.getItem('cnpjRestaurante') || RESTAURANTE.cnpj
+    const cnpjFormatado =
+      cnpjRaw.length === 14
+        ? cnpjRaw.replace(
+            /^(\d{2})(\d{3})(\d{3})(\d{4})(\d{2})$/,
+            '$1.$2.$3/$4-$5'
+          )
+        : cnpjRaw
+
+    return {
+      nome: localStorage.getItem('nomeRestaurante') || RESTAURANTE.nome,
+      endereco: localStorage.getItem('enderecoRestaurante') || RESTAURANTE.endereco,
+      cnpj: cnpjFormatado,
+    }
+  }, []) // [] = lê uma única vez por mount do componente
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FUZZY SEARCH
+// ─────────────────────────────────────────────────────────────────────────────
+
+const fuzzyMatch = (text, query) => {
+  if (!query) return true
+  const t = text.toLowerCase()
+  const q = query.toLowerCase()
+  let qi = 0
+  for (let i = 0; i < t.length && qi < q.length; i++) {
+    if (t[i] === q[qi]) qi++
+  }
+  return qi === q.length
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// RENDERIZAÇÃO DO CUPOM TÉRMICO (80mm)
+//
+// Mudança: agora recebe restaurantConfig como parâmetro em vez de
+// chamar localStorage.getItem a cada invocação — crítico no modo
+// auto-aceitar onde a função é chamada em loop.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const renderPedidoToHTML = (pedido, restaurantConfig = {}, printConfig = {}) => {
+  const {
+    nome: nomeRestaurante = 'Restaurante',
+    endereco: enderecoRestaurante = '',
+    cnpj: cnpjFormatado = '',
+  } = restaurantConfig
+
+  const { fonteTamanho = 12, negritar = false } = printConfig
+  const discountInfo = getDiscountInfo(pedido)
+  const restauranteNomeHtml = escapeHtml(nomeRestaurante)
+  const restauranteEnderecoHtml = escapeHtml(enderecoRestaurante)
+  const cnpjHtml = escapeHtml(cnpjFormatado)
+  const numeroPedidoHtml = escapeHtml(getOrderNumber(pedido))
+  const clienteNomeHtml = escapeHtml(pedido.cliente?.nome || 'Consumidor')
+  const clienteTelefoneHtml = escapeHtml(pedido.cliente?.telefone || '')
+  const totalPedidosClienteHtml = escapeHtml(pedido.cliente?.totalPedidos || 0)
+  const formaPagamento =
+    {
+      dinheiro: 'Dinheiro',
+      pix: 'Pix na Entrega',
+      pix_presencial: 'Pix na Entrega',
+      debito: 'Débito (maquininha)',
+      credito: 'Crédito (maquininha)',
+      debito_maq: 'Maquininha',
+      cartao: 'Cartão na Entrega',
+      refeicao_maq: 'Vale-refeição',
+      na_entrega: 'Pagar na entrega',
+      online_card: 'Cartão Online',
+      pix_online: pedido.statusPagamento === 'aprovado' ? 'Pix Online (PAGO)' : 'Pix Online',
+      mercadopago: 'Mercado Pago',
+    }[pedido.formaPagamento] ||
+    pedido.formaPagamento?.replace(/_/g, ' ').toUpperCase() ||
+    'Não informado'
+  const formaPagamentoHtml = escapeHtml(formaPagamento)
+
+  // Escala proporcional derivada do tamanho base escolhido
+  const t = {
+    base:  `${fonteTamanho}px`,
+    title: `${Math.round(fonteTamanho * 1.35)}px`,
+    order: `${Math.max(18, fonteTamanho)}px`,
+    lg:    `${Math.round(fonteTamanho * 1.1)}px`,
+    total: `${Math.round(fonteTamanho * 1.45)}px`,
+    sm:    `${Math.max(9, fonteTamanho - 1)}px`,
+    xs:    `${Math.max(8, fonteTamanho - 2)}px`,
+    wHeavy: '900',
+    wBold:  negritar ? '900' : '800',
+    wMid:   negritar ? '800' : '700',
+    wBase:  negritar ? '700' : 'normal',
+  }
+
+  const itensHtml = pedido.itens
+    .map((item) => {
+      const totalItem = item.precoUnitario * item.quantidade
+      const quantidadeHtml = escapeHtml(item.quantidade)
+      const nomeItem = escapeHtml(
+        String(item.nome || '').replace(/\s*\(padrão\)/gi, '').trim()
+      )
+      const complementosHtml = item.complementos?.length
+      ? `${item.quantidade > 1 ? '<div class="complementos-label">cada un.:</div>' : ''}
+        <div class="complementos">${item.complementos.map(c => `+ ${escapeHtml(c)}`).join('<br/>')}</div>`
+      : ''
+      const obsHtml = item.obs
+        ? `<div class="obs"><strong>OBS:</strong> ${escapeHtml(item.obs)}</div>`
+        : ''
+      return `
+        <div class="item-row">
+          <div class="item-header">
+            <span class="qty">${quantidadeHtml}x</span>
+            <span class="name">${nomeItem}</span>
+            <span class="item-price">${formatCurrency(totalItem)}</span>
+          </div>
+          ${complementosHtml}${obsHtml}
+        </div>`
+    })
+    .join('')
+
+  return `
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <meta charset="utf-8">
+        <style>
+          /* ── Tokens derivados das preferências do restaurante ── */
+          :root {
+            --fs-base:  ${t.base};
+            --fs-title: ${t.title};
+            --fs-order: ${t.order};
+            --fs-lg:    ${t.lg};
+            --fs-total: ${t.total};
+            --fs-sm:    ${t.sm};
+            --fs-xs:    ${t.xs};
+            --fw-heavy: ${t.wHeavy};
+            --fw-bold:  ${t.wBold};
+            --fw-mid:   ${t.wMid};
+            --fw-base:  ${t.wBase};
+          }
+
+          @page { margin: 0; size: 72mm auto; }
+          html, body { height: auto !important; overflow: hidden; }
+          * { -webkit-print-color-adjust: exact; print-color-adjust: exact; box-sizing: border-box; }
+
+          body {
+            font-family: 'Courier New', Courier, monospace;
+            width: 70mm;
+            margin: 0;
+            padding: 4px 6px 2px 6px;
+            color: #000;
+            font-size: var(--fs-base);
+            font-weight: var(--fw-base);
+            line-height: 1.5;
+            -webkit-font-smoothing: none;
+            display: inline-block;
+          }
+
+          .text-center  { text-align: center; }
+          .title        { font-size: var(--fs-title); font-weight: var(--fw-heavy); margin-bottom: 2px; text-transform: uppercase; letter-spacing: 1px; }
+          .restaurant-address { font-size: var(--fs-sm); font-weight: var(--fw-bold); color: #000; margin-bottom: 6px; }
+          .subtitle     { font-size: var(--fs-base); font-weight: var(--fw-bold); color: #000; border-bottom: 2px dashed #000; padding-bottom: 8px; margin-bottom: 8px; }
+          .order-number { display: block; font-size: var(--fs-order); font-weight: var(--fw-heavy); line-height: 1.15; margin-top: 3px; }
+          .info-group   { margin-bottom: 8px; }
+          .info-label   { font-size: var(--fs-sm); text-transform: uppercase; font-weight: var(--fw-heavy); color: #000; border-bottom: 1px solid #000; margin-bottom: 3px; }
+          .info-value   { font-size: var(--fs-lg); font-weight: var(--fw-bold); color: #000; }
+          .info-sub     { font-size: var(--fs-base); font-weight: var(--fw-mid); color: #000; }
+          .divider-bold { border-top: 2px solid #000; margin: 8px 0; }
+          .divider      { border-top: 1px dashed #000; margin: 8px 0; }
+          .item-row     { margin-bottom: 8px; }
+          .item-header  { display: flex; align-items: flex-start; justify-content: space-between; }
+          .qty          { font-weight: var(--fw-heavy); margin-right: 5px; font-size: var(--fs-lg); min-width: 22px; color: #000; }
+          .name         { font-weight: var(--fw-bold); flex: 1; font-size: var(--fs-base); word-break: break-word; color: #000; }
+          .item-price   { font-weight: var(--fw-heavy); font-size: var(--fs-base); color: #000; text-align: right; white-space: nowrap; margin-left: 4px; min-width: 52px; }
+          .complementos { margin-left: 27px; font-size: var(--fs-sm); font-weight: var(--fw-bold); color: #000; }
+          .complementos-label { margin-left: 27px; font-size: var(--fs-xs); font-weight: var(--fw-heavy); text-transform: uppercase; letter-spacing: 0.5px; color: #000; margin-bottom: 1px; }
+          .obs          { margin-left: 27px; margin-top: 3px; font-weight: var(--fw-heavy); font-size: var(--fs-sm); border-left: 3px solid #000; padding-left: 4px; color: #000; }
+          .totals-row   { display: flex; justify-content: space-between; margin-bottom: 4px; font-size: var(--fs-base); font-weight: var(--fw-bold); color: #000; }
+          .discount-reason { margin: -2px 0 5px; font-size: var(--fs-sm); font-weight: var(--fw-heavy); text-transform: uppercase; }
+          .total-big    { font-size: var(--fs-total); font-weight: var(--fw-heavy); margin-top: 5px; color: #000; }
+          .payment-box  { border: 2px solid #000; padding: 5px; margin-top: 8px; text-align: center; font-weight: var(--fw-heavy); font-size: var(--fs-lg); color: #000; }
+          .agendado-box { background: #000; color: #fff; text-align: center; padding: 6px 4px; margin-bottom: 8px; border-radius: 4px; }
+          .agendado-titulo  { font-size: var(--fs-lg); font-weight: var(--fw-heavy); letter-spacing: 1px; }
+          .agendado-hora    { font-size: var(--fs-order); font-weight: var(--fw-heavy); line-height: 1.15; }
+          .agendado-preparo { font-size: var(--fs-base); font-weight: var(--fw-bold); }
+          .footer       { margin-top: 8px; margin-bottom: 0; text-align: center; font-size: var(--fs-sm); font-weight: var(--fw-bold); color: #000; border-top: 2px dashed #000; padding-top: 6px; padding-bottom: 4px; }
+          .footer-brand { font-size: var(--fs-xs); }
+          .obs-pedido   { margin-left: 0; font-size: var(--fs-base); }
+          .fiel         { font-size: var(--fs-sm); font-weight: var(--fw-heavy); color: #000; margin-top: 2px; }
+        </style>
+      </head>
+      <body>
+        <div class="text-center">
+          <div class="title">${restauranteNomeHtml}</div>
+          ${cnpjFormatado ? `<div class="restaurant-address">CNPJ ${cnpjHtml}</div>` : ''}
+          ${enderecoRestaurante ? `<div class="restaurant-address">${restauranteEnderecoHtml}</div>` : ''}
+          <div class="subtitle">
+            ${formatDate(pedido.createdAt)} — ${formatTime(pedido.createdAt)}<br/>
+            <span class="order-number">PEDIDO #${numeroPedidoHtml}</span>
+          </div>
+        </div>
+
+        ${isAgendado(pedido) ? `
+          <div class="agendado-box">
+            <div class="agendado-titulo">${isDelivery(pedido) ? 'ENTREGA' : 'RETIRADA'} AGENDADA</div>
+            <div class="agendado-hora">${formatTime(pedido.horarioEntrega)}</div>
+            <div class="agendado-preparo">Preparar às ${formatTime(getInicioContagem(pedido))}</div>
+          </div>
+        ` : ''}
+
+        <div class="info-group">
+          <div class="info-label">Cliente</div>
+          <div class="info-value">${clienteNomeHtml}</div>
+          ${pedido.cliente?.telefone ? `<div class="info-sub">Tel: ${clienteTelefoneHtml}</div>` : ''}
+          ${pedido.cliente?.totalPedidos > 1 ? `<div class="fiel">★ Cliente Fiel (${totalPedidosClienteHtml}º pedido)</div>` : ''}
+        </div>
+
+
+        ${isDelivery(pedido) && pedido.enderecoEntrega ? `
+          <div class="info-group">
+            <div class="info-label">Entrega</div>
+            <div class="info-value">${escapeHtml(pedido.enderecoEntrega.rua)}, ${escapeHtml(pedido.enderecoEntrega.numero)}</div>
+            <div class="info-sub">${escapeHtml(pedido.enderecoEntrega.bairro)} — ${escapeHtml(pedido.enderecoEntrega.cidade)}</div>
+            ${pedido.enderecoEntrega.complemento ? `<div class="info-sub">Comp: ${escapeHtml(pedido.enderecoEntrega.complemento)}</div>` : ''}
+          </div>
+        ` : `<div class="payment-box">★ RETIRADA NO BALCÃO ★</div>`}
+
+        <div class="divider-bold"></div>
+        ${itensHtml}
+        ${pedido.observacao ? `<div class="obs obs-pedido"><strong>OBS DO PEDIDO:</strong> ${escapeHtml(pedido.observacao)}</div>` : ''}
+        <div class="divider-bold"></div>
+
+        <div class="totals-row"><span>Subtotal</span><span>${formatCurrency(pedido.subtotal)}</span></div>
+        ${pedido.taxaEntrega > 0 ? `<div class="totals-row"><span>Taxa Entrega</span><span>${formatCurrency(pedido.taxaEntrega)}</span></div>` : ''}
+        ${pedido.desconto > 0 ? `<div class="totals-row"><span>Desconto${pedido.descontoPercentual ? ` (${escapeHtml(pedido.descontoPercentual)}%)` : ''}</span><span>- ${formatCurrency(pedido.desconto)}</span></div>` : ''}
+        ${discountInfo && !pedido.descontoPercentual ? `<div class="discount-reason">Motivo: ${escapeHtml(discountInfo.label)}</div>` : ''}
+        <div class="totals-row total-big"><span>TOTAL</span><span>${formatCurrency(pedido.total)}</span></div>
+
+        <div class="divider"></div>
+        <div class="info-label">Pagamento</div>
+        <div class="info-value">${formaPagamentoHtml}</div>
+        ${pedido.trocoPara ? `<div class="info-sub">Troco para: ${formatCurrency(pedido.trocoPara)}</div>` : ''}
+
+        <div class="footer">
+          ${restauranteNomeHtml} • Obrigado pela preferência!<br/>
+          <span class="footer-brand">Volte sempre!</span>
+        </div>
+      </body>
+    </html>
+  `
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// COMPONENTE PRINCIPAL — OrderManager
+// ─────────────────────────────────────────────────────────────────────────────
+
+export default function OrderManager() {
+  // ── Estado principal ──────────────────────────────────────────────────────
+  const [pedidosPendentes, setPedidosPendentes] = useState([])
+  const [pedidosRecusados, setPedidosRecusados] = useState([])
+  // Pix aguardando na última busca, para perceber quando é aprovado/cancelado
+  const pixAguardandoRef = useRef(new Map())
+  const [pedidos, setPedidos] = useState([])
+  const [loading, setLoading] = useState(true)
+  const [selectedOrder, setSelectedOrder] = useState(null)
+  const [showSettings, setShowSettings] = useState(false)
+  const [showLogoutConfirm, setShowLogoutConfirm] = useState(false)
+  const [showClearDataConfirm, setShowClearDataConfirm] = useState(false)
+  const [printers, setPrinters] = useState([])
+  const [loadingOrderId, setLoadingOrderId] = useState(null)
+  const [isFullScreen, setIsFullScreen] = useState(false)
+  const [finishedColumnCollapsed, setFinishedColumnCollapsed] = useState(false)
+  const [visibleClusters, setVisibleClusters] = useState([])
+  const [isFromCache, setIsFromCache] = useState(false)
+  const [showFaturamento, setShowFaturamento] = useState(
+    localStorage.getItem('showFaturamento') !== 'false'
+  )
+  const [printFailure, setPrintFailure] = useState(null)
+  const [printStatuses, setPrintStatuses] = useState(readPrintStatuses)
+  const [printingOrderIds, setPrintingOrderIds] = useState(() => new Set())
+  const printingOrderIdsRef = useRef(new Set())
+
+  // ── Estado do indicador "Atualizado há Xs" ────────────────────────────────
+  const [lastUpdated, setLastUpdated] = useState(null)
+  const [secondsSinceUpdate, setSecondsSinceUpdate] = useState(0)
+  const [updateState, setUpdateState] = useState({
+    status: 'idle',
+    progress: 0,
+  })
+
+  // ── Busca e filtros ───────────────────────────────────────────────────────
+  const [searchQuery, setSearchQuery] = useState('')
+  const [filters, setFilters] = useState({
+    tipo: TIPO_PEDIDO_TODOS,
+    pagamento: 'todos',
+    valorMin: '',
+    valorMax: '',
+    apenasAgrupados: false,
+    apenasUrgentes: false,
+    apenasRecorrentes: false,
+  })
+  const [showFilters, setShowFilters] = useState(false)
+
+  // ── Sistema de toasts ─────────────────────────────────────────────────────
+  const [toasts, setToasts] = useState([])
+
+  const removeToast = useCallback((id) => {
+    setToasts((prev) => prev.filter((toast) => toast.id !== id))
+  }, [])
+
+  // Dismissal fica a cargo do próprio <Toast> (via onDismiss), que pausa a
+  // contagem quando o mouse está em cima — por isso não há setTimeout aqui.
+  const addToast = useCallback((message, type = 'info', duration = 6000, action = null) => {
+    const id = `${Date.now()}-${Math.random()}`
+    setToasts((prev) => [...prev, { id, message, type, duration, action }])
+  }, [])
+
+  useEffect(() => {
+    localStorage.setItem(PRINT_STATUS_KEY, JSON.stringify(printStatuses))
+  }, [printStatuses])
+
+  const updatePrintStatus = useCallback((orderId, update) => {
+    if (!orderId || orderId === PEDIDO_TESTE_IMPRESSAO._id) return
+    setPrintStatuses((prev) => {
+      const current = prev[orderId] || { status: 'not_printed', count: 0 }
+      const next = typeof update === 'function' ? update(current) : { ...current, ...update }
+      return { ...prev, [orderId]: next }
+    })
+  }, [])
+
+  const getVisiblePrintStatus = useCallback(
+    (orderId) =>
+      printingOrderIds.has(orderId)
+        ? { ...(printStatuses[orderId] || {}), status: 'printing' }
+        : printStatuses[orderId],
+    [printStatuses, printingOrderIds]
+  )
+
+  // ── Ref ao Set global de IDs (singleton de módulo) ────────────────────────
+  const processedOrderIds = useRef(globalProcessedIds)
+
+  // ── Ref do AbortController para cancelar fetches obsoletos ───────────────
+  const abortControllerRef = useRef(null)
+
+  // ── Refs das sidebars de filtros/configurações — fecham com ESC ou clique fora ─
+  const filtersPanelRef = useRef(null)
+  const filtersButtonRef = useRef(null)
+  const settingsPanelRef = useRef(null)
+  const settingsButtonRef = useRef(null)
+
+  // ── Refs dos campos de busca (desktop/mobile) — atalho de teclado "/" ─────
+  const desktopSearchRef = useRef(null)
+  const mobileSearchRef = useRef(null)
+
+  const navigate = useNavigate()
+  const restaurantConfig = useRestaurantConfig()
+  const { isOnline, wasOffline } = useOnlineStatus()
+  const accountInfo = useMemo(
+    () => ({ restaurante: restaurantConfig.nome, cnpj: restaurantConfig.cnpj }),
+    [restaurantConfig.nome, restaurantConfig.cnpj]
+  )
+
+  // ── Configurações — inicializadas do localStorage de forma síncrona ───────
+  const [settings, setSettings] = useState({
+    impressoraAutomatica: localStorage.getItem('impressoraAutomatica') || '',
+    aceitarAutomatico: localStorage.getItem('aceitarAutomatico') !== 'false',
+    notificacoesPush: localStorage.getItem('notificacoesPush') === 'true',
+    somNotificacao: localStorage.getItem('somNotificacao') !== 'false',
+    tempoRefresh: ORDER_REFRESH_SECONDS,
+    agruparPorDistancia:
+      localStorage.getItem('agruparPorDistancia') === 'true',
+    raioCluster: parseFloat(localStorage.getItem('raioCluster')) || 2,
+    enderecoRestaurante:
+      localStorage.getItem('enderecoRestaurante') || RESTAURANTE.endereco,
+    tempoJanela: parseInt(localStorage.getItem('tempoJanela')) || 30,
+    capacidadeEntrega:
+      parseInt(localStorage.getItem('capacidadeEntrega')) || 4,
+    fonteTamanho: parseInt(localStorage.getItem('fonteTamanho')) || 12,  // ← faltava
+    negritar: localStorage.getItem('negritar') === 'true',
+  })
+
+  // ── Hidratação do cache — executa uma única vez no mount ──────────────────
+// Popula os pedidos instantaneamente antes do primeiro fetch terminar.
+// O skeleton nunca aparece se houver cache válido.
+useEffect(() => {
+  const cache = readPedidosCache()
+  if (!cache) return
+  setPedidos(cache.pedidosConfirmados)
+  setPedidosPendentes(cache.aguardandoPagamento)
+  setPedidosRecusados(cache.pagamentosRecusados)
+  setLoading(false)
+  setIsFromCache(true)
+}, [])
+
+  /**
+   * settingsRef — espelho mutable das settings.
+   *
+   * Problema anterior: fetchPedidos dependia de [settings.aceitarAutomatico,
+   * settings.impressoraAutomatica], forçando o useEffect a recriar o setInterval
+   * sempre que qualquer config mudava, causando
+   * um burst de requisições paralelas no momento da mudança.
+   *
+   * Solução: funções de callback leem settingsRef.current no momento da
+   * execução, mantendo deps estáveis e o setInterval estável.
+   */
+  const settingsRef = useRef(settings)
+  useEffect(() => {
+    settingsRef.current = settings
+  }, [settings])
+
+  // ── Timer "Atualizado há Xs" ───────────────────────────────────────────────
+  useEffect(() => {
+    if (!lastUpdated) return
+    setSecondsSinceUpdate(0)
+    const id = setInterval(() => {
+      setSecondsSinceUpdate(Math.floor((Date.now() - lastUpdated) / 1000))
+    }, 1000)
+    return () => clearInterval(id)
+  }, [lastUpdated])
+
+  // ── Monitorar estado de tela cheia ────────────────────────────────────────
+  useEffect(() => {
+    const handleChange = () => setIsFullScreen(!!document.fullscreenElement)
+    document.addEventListener('fullscreenchange', handleChange)
+    return () => document.removeEventListener('fullscreenchange', handleChange)
+  }, [])
+
+  // ── Sidebars de filtros/configurações: fecham com clique fora ─────────────
+  useEffect(() => {
+    if (!showFilters && !showSettings) return
+
+    const isOutside = (target) =>
+      !filtersPanelRef.current?.contains(target) &&
+      !filtersButtonRef.current?.contains(target) &&
+      !settingsPanelRef.current?.contains(target) &&
+      !settingsButtonRef.current?.contains(target)
+
+    const handlePointerDown = (e) => {
+      if (isOutside(e.target)) {
+        setShowFilters(false)
+        setShowSettings(false)
+      }
+    }
+
+    document.addEventListener('mousedown', handlePointerDown)
+    return () => document.removeEventListener('mousedown', handlePointerDown)
+  }, [showFilters, showSettings])
+
+  // ── Atalhos de teclado globais ─────────────────────────────────────────────
+  // "/" foca a busca (padrão de painéis operacionais). ESC fecha sidebars
+  // abertas ou, se a busca estiver focada com texto, limpa e desfoca.
+  useEffect(() => {
+    const isTypingContext = (el) =>
+      el?.tagName === 'INPUT' || el?.tagName === 'TEXTAREA' || el?.isContentEditable
+
+    const handleKeyDown = (e) => {
+      if (e.key === 'Escape') {
+        if (showFilters || showSettings) {
+          setShowFilters(false)
+          setShowSettings(false)
+          return
+        }
+        const isSearchFocused =
+          document.activeElement === desktopSearchRef.current ||
+          document.activeElement === mobileSearchRef.current
+        if (isSearchFocused && searchQuery) {
+          setSearchQuery('')
+          document.activeElement.blur()
+        }
+        return
+      }
+
+      if (e.key === '/' && !isTypingContext(document.activeElement)) {
+        e.preventDefault()
+        const visibleInput = [desktopSearchRef.current, mobileSearchRef.current].find(
+          (el) => el && el.offsetParent !== null
+        )
+        visibleInput?.focus()
+      }
+    }
+
+    document.addEventListener('keydown', handleKeyDown)
+    return () => document.removeEventListener('keydown', handleKeyDown)
+  }, [showFilters, showSettings, searchQuery])
+
+  // ── Bloqueio de suspensão enquanto o gestor estiver aberto ───────────────
+  useEffect(() => {
+    if (!electronAPI.isElectron()) return
+    electronAPI.setPowerBlocker(true)
+    return () => { electronAPI.setPowerBlocker(false) }
+  }, [])
+
+  useEffect(() => {
+    if (!electronAPI.isElectron()) return
+
+    electronAPI.onUpdateAvailable(() => {
+      setUpdateState({ status: 'downloading', progress: 0 })
+    })
+    electronAPI.onUpdateDownloadProgress((progress) => {
+      setUpdateState({
+        status: 'downloading',
+        progress: Math.round(progress?.percent || 0),
+      })
+    })
+    electronAPI.onUpdateDownloaded(() => {
+      setUpdateState({ status: 'ready', progress: 100 })
+    })
+
+    return () => electronAPI.offUpdaterEvents()
+  }, [])
+
+  // ── Carregar impressoras disponíveis (Electron only) ──────────────────────
+  useEffect(() => {
+    const loadPrinters = async () => {
+      if (!electronAPI?.isElectron?.()) return
+      const res = await electronAPI.getPrinters()
+      if (res?.success && Array.isArray(res.printers)) {
+        setPrinters(res.printers)
+        if (res.printers.length > 0 && !settingsRef.current.impressoraAutomatica) {
+          saveSettings({
+            ...settingsRef.current,
+            impressoraAutomatica: res.printers[0].name,
+          })
+        }
+      }
+    }
+    loadPrinters()
+  }, []) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ── saveSettings: persiste no localStorage e atualiza o state ─────────────
+  const saveSettings = useCallback((newSettings) => {
+    Object.keys(newSettings).forEach((key) => {
+      const value = newSettings[key]
+      localStorage.setItem(
+        key,
+        value === null || value === undefined ? '' : String(value)
+      )
+    })
+    setSettings(newSettings)
+  }, [])
+
+  // ── Áudio: reutiliza o singleton, reseta o playhead antes de tocar ────────
+  const playNotificationSound = useCallback(() => {
+    if (!settingsRef.current.somNotificacao) return
+    notificationAudio.currentTime = 0
+    notificationAudio.play().catch((e) => console.error('Erro áudio:', e))
+  }, [])
+
+  // ── Push notification (Electron ou Web Notification API) ─────────────────
+  const sendPushNotification = useCallback((title, body) => {
+    if (!settingsRef.current.notificacoesPush) return
+    if (electronAPI?.isElectron?.()) {
+      electronAPI.sendNotification(title, body)
+    } else if ('Notification' in window && Notification.permission === 'granted') {
+      const notification = new Notification(title, { body, icon: '/logo.png' })
+      notification.onclick = () => {
+        window.focus()
+        notification.close()
+      }
+    }
+  }, [])
+
+  const printWithFeedback = useCallback(
+    async (html) => {
+      const printerName = settingsRef.current.impressoraAutomatica
+
+      try {
+        const res = await electronAPI.printOrder(printerName, html)
+
+        if (res?.success) {
+          setPrintFailure(null)
+          return true
+        }
+
+        const errorMessage =
+          res?.error || 'Verifique se a impressora está ligada e instalada.'
+        setPrintFailure({ printerName, message: errorMessage, at: Date.now() })
+        addToast(
+          'Falha ao imprimir em "' + printerName + '": ' + errorMessage,
+          'error',
+          14000
+        )
+        return false
+      } catch (err) {
+        const errorMessage = err?.message || 'erro inesperado no spooler de impressão.'
+        setPrintFailure({ printerName, message: errorMessage, at: Date.now() })
+        addToast(
+          'Falha ao imprimir em "' + printerName + '": ' + errorMessage,
+          'error',
+          14000
+        )
+        return false
+      }
+    },
+    [addToast]
+  )
+
+  // ── Impressão: restaurantConfig passado como parâmetro (sem getItem extra) ─
+  const handlePrint = useCallback(
+    async (pedido, { automatic = false } = {}) => {
+      const orderId = pedido?._id
+      if (!orderId || printingOrderIdsRef.current.has(orderId)) return false
+
+      printingOrderIdsRef.current.add(orderId)
+      setPrintingOrderIds((current) => new Set(current).add(orderId))
+
+      const usesElectronPrinter =
+        electronAPI?.isElectron?.() && settingsRef.current.impressoraAutomatica
+
+      // No Electron, permite pintar o feedback antes de chamar o spooler.
+      // No navegador, window.open precisa continuar ligado diretamente ao clique.
+      if (usesElectronPrinter) {
+        await new Promise((resolve) => requestAnimationFrame(resolve))
+      }
+
+      try {
+        const html = renderPedidoToHTML(pedido, restaurantConfig, {
+          fonteTamanho: settingsRef.current.fonteTamanho,
+          negritar: settingsRef.current.negritar,
+        })
+
+        if (usesElectronPrinter) {
+          const printed = await printWithFeedback(html)
+          if (printed) {
+            updatePrintStatus(orderId, (current) => {
+              const count = Number(current.count || 0) + 1
+              return {
+                status: count > 1 ? 'reprinted' : (automatic ? 'printed_auto' : 'printed_manual'),
+                count,
+                lastPrintedAt: Date.now(),
+                printerName: settingsRef.current.impressoraAutomatica,
+                error: null,
+              }
+            })
+          } else {
+            updatePrintStatus(orderId, {
+              status: 'failed',
+              lastAttemptAt: Date.now(),
+              printerName: settingsRef.current.impressoraAutomatica,
+              error: 'Falha ao enviar para a impressora.',
+            })
+          }
+          return printed
+        }
+
+        const w = window.open('', '_blank', 'width=380,height=700')
+        if (!w) {
+          updatePrintStatus(orderId, {
+            status: 'failed',
+            lastAttemptAt: Date.now(),
+            error: 'Pop-up de impressão bloqueado.',
+          })
+          addToast('Pop-up bloqueado! Permita pop-ups para este site.', 'error', 10000)
+          return false
+        }
+        w.document.open()
+        w.document.write(html)
+        w.document.close()
+        w.onload = () => {
+          setTimeout(() => { w.focus(); w.print(); w.onafterprint = () => w.close() }, 200)
+        }
+        setTimeout(() => { if (!w.closed) { w.focus(); w.print() } }, 1500)
+        updatePrintStatus(orderId, (current) => {
+          const count = Number(current.count || 0) + 1
+          return {
+            status: count > 1 ? 'reprinted' : 'printed_manual',
+            count,
+            lastPrintedAt: Date.now(),
+            printerName: 'Impressão do sistema',
+            error: null,
+          }
+        })
+        return true
+      } finally {
+        printingOrderIdsRef.current.delete(orderId)
+        setPrintingOrderIds((current) => {
+          const next = new Set(current)
+          next.delete(orderId)
+          return next
+        })
+      }
+    },
+    [restaurantConfig, printWithFeedback, updatePrintStatus, addToast]
+  )
+
+  // ── fetchPedidos ──────────────────────────────────────────────────────────
+  //
+  // 1. AbortController: cancela request anterior antes de iniciar um novo,
+  //    e cancela ao desmontar — evita state updates em componente morto.
+  // 2. settingsRef.current: lê configurações no momento da execução
+  //    sem adicionar deps voláteis ao useCallback.
+  // 3. Pedidos vêm de GET /pedidos/hoje já normalizados (casaMiaPedido.js).
+  // ──────────────────────────────────────────────────────────────────────────
+  const fetchPedidos = useCallback(async () => {
+    // Cancela qualquer request em voo antes de iniciar um novo
+    abortControllerRef.current?.abort()
+    abortControllerRef.current = new AbortController()
+
+    const { aceitarAutomatico, impressoraAutomatica } = settingsRef.current
+
+    try {
+      const data = await listarPedidosDoDia({
+        signal: abortControllerRef.current.signal,
+      })
+
+      // Se não for OK (ex: 401), para aqui sem logar erro
+      if (!data) return
+
+      const sorted = data.sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt))
+
+      const deliveredOrderIds = new Set(
+        sorted.filter((pedido) => pedido.status === 'Entregue').map((pedido) => pedido._id)
+      )
+      if (deliveredOrderIds.size > 0) {
+        setPrintStatuses((current) => {
+          const next = { ...current }
+          let changed = false
+          deliveredOrderIds.forEach((orderId) => {
+            if (next[orderId]) {
+              delete next[orderId]
+              changed = true
+            }
+          })
+          return changed ? next : current
+        })
+      }
+
+      const pedidosConfirmados = []
+      const aguardandoPagamento = []
+      const pagamentosRecusados = []
+
+      sorted.forEach((p) => {
+        if (p.pagamentoRecusado) pagamentosRecusados.push(p)
+        else if (p.aguardandoPagamento) aguardandoPagamento.push(p)
+        else pedidosConfirmados.push(p)
+      })
+
+      setPedidosPendentes(aguardandoPagamento)
+      setPedidosRecusados(pagamentosRecusados)
+
+      // Pix que estava aguardando na busca anterior e mudou
+      const idsAtuais = new Set(sorted.map((p) => p._id))
+      const pixAprovados = pedidosConfirmados.filter((p) => pixAguardandoRef.current.has(p._id))
+      const pixCancelados = [...pixAguardandoRef.current.values()].filter(
+        (p) => !idsAtuais.has(p._id)
+      )
+      pixAguardandoRef.current = new Map(
+        [...aguardandoPagamento, ...pagamentosRecusados].map((p) => [p._id, p])
+      )
+
+      pixAprovados.forEach((p) => {
+        addToast(`Pix do pedido #${getOrderNumber(p)} aprovado.`, 'success')
+        // Aprovado pelo "Verificar pagamento" já entra em preparo: trata como
+        // pedido novo mesmo fora da janela de pedido recente.
+        if (p.status !== 'Em preparação' || processedOrderIds.current.has(p._id)) return
+        processedOrderIds.current.add(p._id)
+        globalAnnouncedIds.add(p._id)
+        playNotificationSound()
+        sendPushNotification('Pix aprovado!', `Pedido #${getOrderNumber(p)} enviado para a cozinha.`)
+        if (impressoraAutomatica) handlePrint(p, { automatic: true })
+      })
+      pixCancelados.forEach((p) => {
+        addToast(
+          `Pedido #${getOrderNumber(p)} (Pix não pago) saiu da lista: foi cancelado ou excluído.`,
+          'error',
+          10000
+        )
+      })
+
+      // Pedido aberto que foi cancelado ou excluído no painel: fecha a janela
+      // para ninguém tentar confirmar/avançar um pedido que não existe mais
+      setSelectedOrder((atual) => (atual && !idsAtuais.has(atual._id) ? null : atual))
+
+      writePedidosCache({ pedidosConfirmados, aguardandoPagamento, pagamentosRecusados })
+      setIsFromCache(false)
+
+      // Pedidos que o painel web já aceitou antes do gestor ver
+      const printStatusesAtuais = readPrintStatuses()
+      const aceitosPeloPainel = pedidosConfirmados.filter(
+        (p) =>
+          p.status === 'Em preparação' &&
+          !processedOrderIds.current.has(p._id) &&
+          !printStatusesAtuais[p._id] &&
+          Date.now() - new Date(p.createdAt).getTime() < JANELA_PEDIDO_NOVO_MS
+      )
+      // Os demais já existentes (abertura do gestor no meio do expediente)
+      // ficam marcados como vistos para não disparar som/impressão repetidos.
+      pedidosConfirmados.forEach((p) => {
+        if (p.status !== 'Recebido' && !aceitosPeloPainel.includes(p)) {
+          processedOrderIds.current.add(p._id)
+        }
+      })
+
+      if (aceitosPeloPainel.length > 0) {
+        aceitosPeloPainel.forEach((p) => processedOrderIds.current.add(p._id))
+        // Quem já foi avisado como "Recebido" não toca de novo, só imprime
+        const naoAvisados = aceitosPeloPainel.filter((p) => !globalAnnouncedIds.has(p._id))
+        if (naoAvisados.length > 0) {
+          naoAvisados.forEach((p) => globalAnnouncedIds.add(p._id))
+          playNotificationSound()
+          sendPushNotification(
+            naoAvisados.length > 1 ? 'Novos Pedidos!' : 'Novo Pedido!',
+            naoAvisados.length > 1
+              ? `${naoAvisados.length} pedidos enviados para a cozinha.`
+              : `Pedido #${getOrderNumber(naoAvisados[0])} enviado para a cozinha.`
+          )
+        }
+        if (impressoraAutomatica) {
+          aceitosPeloPainel.forEach((pedido) => handlePrint(pedido, { automatic: true }))
+        }
+      }
+
+      if (aceitarAutomatico) {
+        const novos = pedidosConfirmados.filter(
+          (p) =>
+            p.status === 'Recebido' &&
+            !processedOrderIds.current.has(p._id)
+        )
+
+        for (const pedido of novos) {
+          try {
+            await atualizarStatus(pedido._id, 'Em preparação')
+            processedOrderIds.current.add(pedido._id)
+            globalAnnouncedIds.add(pedido._id)
+            playNotificationSound()
+            sendPushNotification(
+              'Novo Pedido Aceito!',
+              'Pedido #' + getOrderNumber(pedido) + ' enviado para cozinha.'
+            )
+            pedido.status = 'Em preparação'
+            if (impressoraAutomatica) handlePrint(pedido, { automatic: true })
+          } catch (err) {
+            console.error('Erro ao aceitar pedido automaticamente:', err)
+            addToast(
+              err?.message || 'Erro ao aceitar pedido automaticamente.',
+              'error'
+            )
+          }
+        }
+      } else {
+        const novosPendentes = pedidosConfirmados.filter(
+          (p) =>
+            p.status === 'Recebido' &&
+            !globalAnnouncedIds.has(p._id)
+        )
+        if (novosPendentes.length > 0) {
+          novosPendentes.forEach((p) => globalAnnouncedIds.add(p._id))
+          playNotificationSound()
+          sendPushNotification('Novo Pedido!', 'Você tem novos pedidos para aceitar.')
+        }
+      }
+
+      setPedidos(pedidosConfirmados)
+
+      // Registra timestamp para o indicador "Atualizado há Xs"
+      setLastUpdated(Date.now())
+      setSecondsSinceUpdate(0)
+    } catch (error) {
+      // AbortError é esperado e silencioso — não é um erro real
+      if (error.name === 'AbortError') return
+      console.error('Erro fetch:', error)
+    } finally {
+      setLoading(false)
+    }
+  }, [playNotificationSound, sendPushNotification, handlePrint, addToast])
+
+  useEffect(() => {
+    if (isOnline && wasOffline.current) fetchPedidos()
+  }, [isOnline, wasOffline, fetchPedidos])
+
+  // ── Intervalo de refresh ──────────────────────────────────────────────────
+  // Pedidos precisam chegar rapido no caixa; mantemos 10s fixo para evitar
+  // configuracao operacional desnecessaria.
+  useEffect(() => {
+    fetchPedidos()
+    const interval = setInterval(fetchPedidos, ORDER_REFRESH_SECONDS * 1000)
+    return () => {
+      clearInterval(interval)
+      abortControllerRef.current?.abort()
+    }
+  }, [fetchPedidos])
+
+  // ── advanceStatus com atualização otimista ────────────────────────────────
+  //
+  // 1. Atualiza o state local imediatamente → UI responde em < 16ms
+  // 2. Dispara a PATCH na API em background (o painel avisa o cliente por push)
+  // 3. Em caso de erro, faz rollback do state e exibe toast de erro
+  // 4. Em caso de sucesso, confirma com dados frescos do servidor
+  // ──────────────────────────────────────────────────────────────────────────
+  const advanceStatus = useCallback(
+    async (pedido) => {
+      const nextStatus = getNextStatus(pedido.status)
+      if (!nextStatus) return { success: false, deferred: false }
+
+      setLoadingOrderId(pedido._id)
+      setPedidos((prev) =>
+        prev.map((p) => p._id === pedido._id ? { ...p, status: nextStatus } : p)
+      )
+
+      try {
+        await atualizarStatus(pedido._id, nextStatus)
+        processedOrderIds.current.add(pedido._id)
+
+        if (nextStatus === 'Em preparação' && settingsRef.current.impressoraAutomatica) {
+          handlePrint({ ...pedido, status: nextStatus }, { automatic: true })
+        }
+
+        await fetchPedidos()
+        addToast(
+          getOrderAction(pedido)?.successLabel || 'Status do pedido atualizado.',
+          'success',
+          15000,
+          {
+            label: 'Desfazer',
+            onClick: async () => {
+              setLoadingOrderId(pedido._id)
+
+              try {
+                const currentOrder = await buscarPedido(pedido._id)
+                if (currentOrder.status !== nextStatus) {
+                  addToast('O pedido já mudou de etapa e não pode mais ser desfeito.', 'warning')
+                  return false
+                }
+
+                await atualizarStatus(pedido._id, pedido.status)
+                setPedidos((prev) =>
+                  prev.map((item) =>
+                    item._id === pedido._id ? { ...item, status: pedido.status } : item
+                  )
+                )
+                await fetchPedidos()
+                addToast('Alteração de status desfeita.', 'info')
+                return true
+              } catch (err) {
+                addToast(err?.message || 'Não foi possível desfazer a alteração.', 'error', 10000)
+                return false
+              } finally {
+                setLoadingOrderId(null)
+              }
+            },
+          }
+        )
+        return { success: true, deferred: false }
+      } catch (err) {
+        setPedidos((prev) =>
+          prev.map((p) => p._id === pedido._id ? { ...p, status: pedido.status } : p)
+        )
+        addToast(
+          err?.message || 'Erro ao atualizar status. Verifique a conexão e tente novamente.',
+          'error'
+        )
+        return { success: false, deferred: false }
+      } finally {
+        setLoadingOrderId(null)
+      }
+    },
+    [handlePrint, fetchPedidos, addToast]
+  )
+
+  // ── Confirmação manual de Pix (cliente pagou, webhook não chegou) ─────────
+  const confirmPixPayment = useCallback(
+    async (pedido) => {
+      setLoadingOrderId(pedido._id)
+      try {
+        await confirmarPagamento(pedido._id)
+        processedOrderIds.current.add(pedido._id)
+        pixAguardandoRef.current.delete(pedido._id)
+        if (settingsRef.current.impressoraAutomatica) {
+          handlePrint({ ...pedido, status: 'Em preparação', statusPagamento: 'aprovado' }, { automatic: true })
+        }
+        await fetchPedidos()
+        addToast(`Pagamento do pedido #${getOrderNumber(pedido)} confirmado. Enviado para preparação.`, 'success')
+        return { success: true }
+      } catch (err) {
+        addToast(err?.message || 'Não foi possível confirmar o pagamento.', 'error', 10000)
+        return { success: false }
+      } finally {
+        setLoadingOrderId(null)
+      }
+    },
+    [handlePrint, fetchPedidos, addToast]
+  )
+
+  // ── Verificar Pix no Mercado Pago (o "Verificar Pagamento" do painel) ─────
+  // Aprovado/cancelado é avisado pela busca seguinte (ver pixAguardandoRef).
+  const checkPixPayment = useCallback(
+    async (pedido) => {
+      setLoadingOrderId(pedido._id)
+      try {
+        const atualizado = await verificarPagamentoPix(pedido._id)
+        await fetchPedidos()
+        if (atualizado?.aguardandoPagamento) {
+          addToast(
+            atualizado.pagamentoRecusado
+              ? `O Pix do pedido #${getOrderNumber(pedido)} foi recusado.`
+              : `O Pix do pedido #${getOrderNumber(pedido)} ainda não foi pago.`,
+            atualizado.pagamentoRecusado ? 'error' : 'info'
+          )
+          return { success: false }
+        }
+        return { success: true }
+      } catch (err) {
+        addToast(err?.message || 'Não foi possível verificar o pagamento.', 'error', 10000)
+        return { success: false }
+      } finally {
+        setLoadingOrderId(null)
+      }
+    },
+    [fetchPedidos, addToast]
+  )
+
+  const cancelPixOrder = useCallback(
+    async (pedido) => {
+      setLoadingOrderId(pedido._id)
+      try {
+        await cancelarPedido(pedido._id)
+        pixAguardandoRef.current.delete(pedido._id)
+        await fetchPedidos()
+        addToast(`Pedido #${getOrderNumber(pedido)} cancelado.`, 'success')
+        return { success: true }
+      } catch (err) {
+        addToast(err?.message || 'Não foi possível cancelar o pedido.', 'error', 10000)
+        return { success: false }
+      } finally {
+        setLoadingOrderId(null)
+      }
+    },
+    [fetchPedidos, addToast]
+  )
+
+  // Se o webhook do Mercado Pago falhar, o Pix pago ficaria parado em
+  // "Aguardando Pagamento". Pergunta ao Mercado Pago a cada minuto.
+  useEffect(() => {
+    const id = setInterval(async () => {
+      const paraVerificar = [...pixAguardandoRef.current.values()].filter(
+        (p) =>
+          p.pagamentoId &&
+          !p.pagamentoRecusado &&
+          Date.now() - new Date(p.createdAt).getTime() < PIX_VERIFICACAO_JANELA_MS
+      )
+      if (paraVerificar.length === 0 || !navigator.onLine) return
+      const resultados = await Promise.all(
+        paraVerificar.map((p) => verificarPagamentoPix(p._id).catch(() => null))
+      )
+      if (resultados.some((r) => r && !r.aguardandoPagamento)) fetchPedidos()
+    }, PIX_VERIFICACAO_INTERVALO_MS)
+    return () => clearInterval(id)
+  }, [fetchPedidos])
+
+  // ── Toggle de notificações push (solicita permissão se necessário) ────────
+  const handleToggleNotification = useCallback(() => {
+    const newState = !settingsRef.current.notificacoesPush
+    saveSettings({ ...settingsRef.current, notificacoesPush: newState })
+    if (newState) {
+      if ('Notification' in window && Notification.permission !== 'granted') {
+        Notification.requestPermission().then((permission) => {
+          if (permission === 'granted') {
+            sendPushNotification(
+              'Notificações Ativadas',
+              'Tudo pronto para receber pedidos!'
+            )
+          }
+        })
+      } else {
+        sendPushNotification(
+          'Notificações Ativadas',
+          'Tudo pronto para receber pedidos!'
+        )
+      }
+    }
+  }, [saveSettings, sendPushNotification])
+
+  const handleConfirmLogout = useCallback(() => {
+    clearSession()
+    setShowLogoutConfirm(false)
+    navigate('/login')
+  }, [navigate])
+
+  const handleClearLocalData = useCallback(() => {
+    localStorage.clear()
+    sessionStorage.clear()
+    setShowClearDataConfirm(false)
+    navigate('/login')
+  }, [navigate])
+
+  const handleInstallUpdate = useCallback(() => {
+    electronAPI.installUpdate()
+  }, [])
+
+  // ── Derivações memoizadas dos pedidos ─────────────────────────────────────
+  const activeOrders = useMemo(
+    () =>
+      pedidos.filter(
+        (p) =>
+          p.status !== 'Entregue' &&
+          p.status !== 'Cancelado' &&
+          p.status !== 'Saiu para entrega'
+      ),
+    [pedidos]
+  )
+
+  const finishedOrders = useMemo(
+    () =>
+      pedidos.filter((p) =>
+        ['Saiu para entrega', 'Entregue', 'Cancelado'].includes(p.status)
+      ),
+    [pedidos]
+  )
+
+  const clusteredActive = useOrderClustering(
+    activeOrders,
+    settings.agruparPorDistancia,
+    settings.raioCluster,
+    settings.tempoJanela,
+    settings.capacidadeEntrega
+  )
+
+  const pedidosComClusters = useMemo(
+    () => [...clusteredActive, ...finishedOrders],
+    [clusteredActive, finishedOrders]
+  )
+
+  const pedidosFiltrados = useMemo(() => {
+    let resultado = pedidosComClusters
+
+    if (searchQuery.trim()) {
+      const query = searchQuery.trim()
+      const normalizedQuery = query.toLowerCase()
+      const queryDigits = query.replace(/\D/g, '')
+      resultado = resultado.filter((p) => {
+        const phoneDigits = String(p.cliente?.telefone || '').replace(/\D/g, '')
+        const directMatch =
+          String(getOrderNumber(p)).toLowerCase().includes(normalizedQuery) ||
+          String(p._id || '').toLowerCase().includes(normalizedQuery) ||
+          (queryDigits.length >= 3 && phoneDigits.endsWith(queryDigits))
+        const searchText = [
+          getOrderNumber(p),
+          p._id || '',
+          p.cliente?.nome || '',
+          p.cliente?.telefone || '',
+          p.enderecoEntrega?.rua || '',
+          p.enderecoEntrega?.bairro || '',
+          ...(p.itens || []).map((i) => i.nome),
+        ].join(' ')
+        return directMatch || fuzzyMatch(searchText, query)
+      })
+    }
+
+    if (filters.tipo !== TIPO_PEDIDO_TODOS)
+      resultado = resultado.filter(
+        (p) => normalizeTipoPedido(p.tipo) === normalizeTipoPedido(filters.tipo)
+      )
+
+    if (filters.pagamento !== 'todos')
+      resultado = resultado.filter((p) =>
+        p.formaPagamento?.includes(filters.pagamento)
+      )
+
+    if (filters.valorMin)
+      resultado = resultado.filter(
+        (p) => p.total >= parseFloat(filters.valorMin)
+      )
+
+    if (filters.valorMax)
+      resultado = resultado.filter(
+        (p) => p.total <= parseFloat(filters.valorMax)
+      )
+
+    if (filters.apenasAgrupados)
+      resultado = resultado.filter(
+        (p) => p.clusterId && p.clusterSize > 1
+      )
+
+    if (filters.apenasUrgentes)
+      resultado = resultado.filter(
+        (p) => getTimeElapsed(getInicioContagem(p)).isUrgent
+      )
+
+    if (filters.apenasRecorrentes)
+      resultado = resultado.filter((p) => p.cliente?.totalPedidos >= 2)
+
+    return resultado
+  }, [pedidosComClusters, searchQuery, filters])
+
+  const columns = useMemo(
+    () => ({
+      pendente: pedidosFiltrados.filter(
+        (p) => !p.status || p.status === 'Recebido'
+      ),
+      // Agendado só sobe na fila quando chega a hora do preparo
+      preparo: pedidosFiltrados
+        .filter((p) => p.status === 'Em preparação')
+        .sort((a, b) => new Date(getInicioContagem(a)) - new Date(getInicioContagem(b))),
+      entrega: pedidosFiltrados.filter((p) =>
+        ['Saiu para entrega', 'Saiu para Entrega'].includes(p.status)
+      ),
+      concluido: pedidosFiltrados.filter((p) => p.status === 'Entregue'),
+    }),
+    [pedidosFiltrados]
+  )
+
+  const totalDia = useMemo(
+    () => columns.concluido.reduce((acc, curr) => acc + (curr.total || 0), 0),
+    [columns.concluido]
+  )
+
+  // ── Alarme recorrente para pedido novo aguardando aceite ──────────────────
+  // Um beep único se perde num caixa/cozinha barulhento. Enquanto houver
+  // pedido em "Recebido" pendente de aceite manual, repete o som até o
+  // operador aceitar — evita pedido esquecido na fila.
+  const pendingAcceptCount = columns.pendente.length
+  useEffect(() => {
+    if (settings.aceitarAutomatico || pendingAcceptCount === 0) return
+    const interval = setInterval(() => playNotificationSound(), 25000)
+    return () => clearInterval(interval)
+  }, [settings.aceitarAutomatico, pendingAcceptCount, playNotificationSound])
+
+  const toggleFullScreen = useCallback(() => {
+    if (!document.fullscreenElement) {
+      document.documentElement.requestFullscreen().catch((err) =>
+        console.log(err)
+      )
+    } else {
+      document.exitFullscreen()
+    }
+  }, [])
+
+  const clearFilters = useCallback(() => {
+    setSearchQuery('')
+    setFilters({
+      tipo: TIPO_PEDIDO_TODOS,
+      pagamento: 'todos',
+      valorMin: '',
+      valorMax: '',
+      apenasAgrupados: false,
+      apenasUrgentes: false,
+      apenasRecorrentes: false,
+    })
+  }, [])
+
+  const advanceCluster = useCallback(
+    async (clusterId) => {
+      const clusterOrders = pedidosComClusters.filter(
+        (p) => p.clusterId === clusterId
+      )
+      for (const pedido of clusterOrders) {
+        await advanceStatus(pedido)
+      }
+      await fetchPedidos()
+      const stillActive = pedidosComClusters.some(
+        (p) =>
+          p.clusterId === clusterId &&
+          p.status !== 'Entregue' &&
+          p.status !== 'Cancelado'
+      )
+      if (!stillActive) {
+        setVisibleClusters((prev) => prev.filter((id) => id !== clusterId))
+      }
+    },
+    [pedidosComClusters, advanceStatus, fetchPedidos]
+  )
+
+  const toggleClusterPin = useCallback((clusterId) => {
+    setVisibleClusters((prev) =>
+      prev.includes(clusterId)
+        ? prev.filter((id) => id !== clusterId)
+        : [...prev, clusterId]
+    )
+  }, [])
+
+  const uniqueClusters = useMemo(() => {
+    const clusterMap = new Map()
+    pedidosComClusters.forEach((p) => {
+      if (
+        p.clusterId &&
+        p.clusterSize > 1 &&
+        p.status !== 'Entregue' &&
+        p.status !== 'Cancelado'
+      ) {
+        if (!clusterMap.has(p.clusterId)) {
+          clusterMap.set(p.clusterId, {
+            clusterId: p.clusterId,
+            clusterColor: p.clusterColor,
+            clusterSize: p.clusterSize,
+          })
+        }
+      }
+    })
+    return Array.from(clusterMap.values())
+  }, [pedidosComClusters])
+
+  const activeFiltersCount = useMemo(() => {
+    let count = 0
+    if (searchQuery.trim()) count++
+    if (filters.tipo !== TIPO_PEDIDO_TODOS) count++
+    if (filters.pagamento !== 'todos') count++
+    if (filters.valorMin || filters.valorMax) count++
+    if (filters.apenasAgrupados) count++
+    if (filters.apenasUrgentes) count++
+    if (filters.apenasRecorrentes) count++
+    return count
+  }, [searchQuery, filters])
+
+  const delayedOrders = useMemo(
+    () => {
+      const elapsedAt = lastUpdated
+        ? lastUpdated + secondsSinceUpdate * 1000
+        : Date.now()
+
+      return pedidosComClusters.filter((p) => {
+        if (['Entregue', 'Cancelado'].includes(p.status)) return false
+        return getTimeElapsed(getInicioContagem(p), elapsedAt).minutes > getPrazoMinutos(p)
+      })
+    },
+    [pedidosComClusters, lastUpdated, secondsSinceUpdate]
+  )
+
+  // Agendados que entraram na janela de preparo e ainda não saíram da loja
+  const agendadosParaPreparar = useMemo(
+    () => {
+      const now = lastUpdated
+        ? lastUpdated + secondsSinceUpdate * 1000
+        : Date.now()
+
+      return pedidosComClusters.filter(
+        (p) =>
+          isAgendado(p) &&
+          ['Recebido', 'Em preparação'].includes(p.status) &&
+          !isAguardandoHorario(p, now) &&
+          now < new Date(p.horarioEntrega).getTime()
+      )
+    },
+    [pedidosComClusters, lastUpdated, secondsSinceUpdate]
+  )
+
+  // Avisa uma vez por pedido quando chega a hora de começar um agendado
+  const avisadosPreparoRef = useRef(new Set())
+  useEffect(() => {
+    const novos = agendadosParaPreparar.filter(
+      (p) => !avisadosPreparoRef.current.has(p._id)
+    )
+    if (novos.length === 0) return
+    novos.forEach((p) => avisadosPreparoRef.current.add(p._id))
+    playNotificationSound()
+    sendPushNotification(
+      'Hora de preparar agendado',
+      novos
+        .map((p) => `#${getOrderNumber(p)} para ${formatTime(p.horarioEntrega)}`)
+        .join(', ')
+    )
+  }, [agendadosParaPreparar, playNotificationSound, sendPushNotification])
+
+  const operationalAlerts = useMemo(() => {
+    const alerts = []
+
+    if (agendadosParaPreparar.length > 0) {
+      alerts.push({
+        id: 'scheduled-start',
+        severity: 'warning',
+        icon: 'fa-calendar-check',
+        label: `${agendadosParaPreparar.length} agendado${agendadosParaPreparar.length > 1 ? 's' : ''} para preparar`,
+        detail: `#${getOrderNumber(agendadosParaPreparar[0])} para ${formatTime(agendadosParaPreparar[0].horarioEntrega)}`,
+        onClick: () => setSelectedOrder(agendadosParaPreparar[0]),
+      })
+    }
+
+    if (delayedOrders.length > 0) {
+      alerts.push({
+        id: 'delayed-orders',
+        severity: 'critical',
+        icon: 'fa-stopwatch',
+        label: `${delayedOrders.length} atrasado${delayedOrders.length > 1 ? 's' : ''}`,
+        detail: `Mais antigo #${getOrderNumber(delayedOrders[0])}`,
+        onClick: () => setSelectedOrder(delayedOrders[0]),
+      })
+    }
+
+    if (pedidosRecusados.length > 0) {
+      alerts.push({
+        id: 'pix-recused',
+        severity: 'critical',
+        icon: 'fa-circle-xmark',
+        label: `${pedidosRecusados.length} Pix recusado${pedidosRecusados.length > 1 ? 's' : ''}`,
+        detail: `Pedido #${getOrderNumber(pedidosRecusados[0])}`,
+        onClick: () => setSelectedOrder(pedidosRecusados[0]),
+      })
+    }
+
+    if (pedidosPendentes.length > 0) {
+      alerts.push({
+        id: 'pix-pending',
+        severity: 'warning',
+        icon: 'fa-clock',
+        label: `${pedidosPendentes.length} Pix pendente${pedidosPendentes.length > 1 ? 's' : ''}`,
+        detail: `Aguardando confirmação`,
+        onClick: () => setSelectedOrder(pedidosPendentes[0]),
+      })
+    }
+
+    if (printFailure) {
+      alerts.push({
+        id: 'print-failure',
+        severity: 'critical',
+        icon: 'fa-print',
+        label: 'Falha ao imprimir',
+        detail: printFailure.printerName || printFailure.message,
+      })
+    }
+
+    if (!isOnline || isFromCache) {
+      alerts.push({
+        id: 'offline-cache',
+        severity: !isOnline ? 'critical' : 'warning',
+        icon: 'fa-wifi',
+        label: !isOnline ? 'Loja sem internet' : 'Modo cache',
+        detail: !isOnline ? 'Exibindo últimos dados salvos' : 'Sincronizando pedidos',
+      })
+    }
+
+    return alerts
+  }, [
+    agendadosParaPreparar,
+    delayedOrders,
+    pedidosRecusados,
+    pedidosPendentes,
+    printFailure,
+    isOnline,
+    isFromCache,
+  ])
+
+  // ── Skeleton durante loading inicial ─────────────────────────────────────
+  if (loading) {
+    return (
+      <KanbanSkeleton hasNewOrdersColumn={!settings.aceitarAutomatico} />
+    )
+  }
+
+  // ── RENDER ────────────────────────────────────────────────────────────────
+  return (
+    <TickProvider>
+      <div className="h-screen overflow-hidden bg-white text-gray-900 flex flex-col">
+
+        {/* ── Header ─────────────────────────────────────────────────────── */}
+        <header className="sticky top-0 z-30 bg-white border-b border-gray-200 shadow-sm shrink-0">
+          <div className="w-full px-4 py-3 flex items-center justify-between gap-4">
+
+            {/* Logo + título */}
+            <div className="flex items-center gap-4">
+              <div
+                className="w-10 h-10 rounded-lg bg-[#7f22fe] flex items-center justify-center shadow-sm"
+                aria-hidden="true"
+              >
+                <i className="fas fa-pizza-slice text-white text-lg"></i>
+              </div>
+              <div>
+                <h1 className="text-xl font-bold text-gray-900 leading-tight">
+                  Casa Mia · Pedidos
+                </h1>
+                <div className="flex items-center gap-2 text-sm" aria-live="polite">
+                {isOnline ? (
+                  <>
+                    <span className="w-1.5 h-1.5 bg-emerald-500 rounded-full animate-pulse" aria-hidden="true" />
+                    <span className="text-gray-500 font-medium">Loja Online</span>
+                    {lastUpdated && !isFromCache && (
+                      <span className="text-xs text-gray-400 hidden lg:inline">
+                        · Atualizado há {secondsSinceUpdate}s
+                      </span>
+                    )}
+                    {isFromCache && (
+                      <span className="text-xs text-amber-600 hidden lg:inline">
+                        · Sincronizando...
+                      </span>
+                    )}
+                  </>
+                ) : (
+                  <span
+                    className="inline-flex items-center gap-1.5 text-xs font-bold text-amber-700 bg-amber-50 border border-amber-300 px-2.5 py-1 rounded-full"
+                    title="Sem conexão com a internet. Exibindo últimos dados salvos."
+                    role="alert"
+                  >
+                    <i className="fas fa-wifi text-[10px]" aria-hidden="true" />
+                    Sem conexão
+                    {isFromCache && <span className="font-normal opacity-80">· modo cache</span>}
+                  </span>
+                )}
+              </div>
+              </div>
+            </div>
+
+            {/* Barra de busca desktop */}
+            <div className="flex-1 max-w-md hidden lg:block">
+              <div className="relative">
+                <input
+                  ref={desktopSearchRef}
+                  type="text"
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  placeholder="Buscar por nº do pedido, cliente ou últimos dígitos do telefone... (/)"
+                  className="w-full pl-10 pr-4 py-2 rounded-lg bg-gray-50 border border-gray-300 text-sm focus:outline-none focus:border-[#7f22fe] focus:ring-2 focus:ring-[#7f22fe]/20 transition-all"
+                  aria-label="Buscar pedidos"
+                />
+                <i
+                  className="fas fa-search absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 text-sm"
+                  aria-hidden="true"
+                ></i>
+                {searchQuery && (
+                  <button
+                    onClick={() => setSearchQuery('')}
+                    className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600"
+                    aria-label="Limpar busca"
+                  >
+                    <i className="fas fa-times text-sm" aria-hidden="true"></i>
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* Ações do header */}
+            <div className="flex items-center gap-3">
+
+              {/* Indicador de filtros ativos */}
+              {activeFiltersCount > 0 && (
+                <div className="hidden md:flex items-center gap-2 px-3 py-2 bg-[#7f22fe]/10 border border-[#7f22fe]/30 rounded-lg">
+                  <i
+                    className="fas fa-filter text-[#7f22fe] text-sm"
+                    aria-hidden="true"
+                  ></i>
+                  <span className="text-sm font-bold text-[#7f22fe]">
+                    {activeFiltersCount} filtro{activeFiltersCount > 1 ? 's' : ''}
+                  </span>
+                  <button
+                    onClick={clearFilters}
+                    className="ml-1 text-[#7f22fe] hover:text-[#6b1de0]"
+                    aria-label="Limpar todos os filtros ativos"
+                  >
+                    <i className="fas fa-times text-sm" aria-hidden="true"></i>
+                  </button>
+                </div>
+              )}
+
+              {/* Pix online aguardando pagamento ou recusado */}
+              <PixPendingMenu
+                pendentes={pedidosPendentes}
+                recusados={pedidosRecusados}
+                onSelect={setSelectedOrder}
+              />
+
+              {/* Faturamento do dia */}
+              <div className="hidden lg:flex flex-col items-end px-4 border-r border-gray-200 mr-2">
+                <div className="flex items-center gap-1.5">
+                  <span className="text-xs text-gray-500 uppercase tracking-wide font-semibold">
+                    Faturamento (Entregues)
+                  </span>
+                  <button
+                    onClick={() => {
+                      const next = !showFaturamento
+                      setShowFaturamento(next)
+                      localStorage.setItem('showFaturamento', String(next))
+                    }}
+                    className="text-gray-400 hover:text-gray-600 transition-colors focus:outline-none"
+                    aria-label={showFaturamento ? 'Ocultar faturamento' : 'Mostrar faturamento'}
+                    title={showFaturamento ? 'Ocultar' : 'Mostrar'}
+                    type="button"
+                  >
+                    <i className={`fas ${showFaturamento ? 'fa-eye' : 'fa-eye-slash'} text-xs`} aria-hidden="true" />
+
+                  </button>
+                </div>
+                <span className="text-xl font-bold text-emerald-600 tabular-nums tracking-wide">
+                  {showFaturamento ? formatCurrency(totalDia) : '•••••'}
+                </span>
+              </div>
+
+
+              {/* Filtros */}
+              <button
+                ref={filtersButtonRef}
+                onClick={() => {
+                  setShowFilters(!showFilters)
+                  setShowSettings(false)
+                }}
+                className={`w-10 h-10 rounded-lg transition-all border ${
+                  showFilters || activeFiltersCount > 0
+                    ? 'bg-[#7f22fe] text-white border-[#7f22fe] shadow-md'
+                    : 'bg-gray-50 hover:bg-gray-100 border-gray-200 text-gray-600'
+                }`}
+                aria-label="Abrir filtros avançados"
+                aria-expanded={showFilters}
+                aria-controls="sidebar-filtros"
+              >
+                <i className="fas fa-sliders-h text-sm" aria-hidden="true"></i>
+              </button>
+
+              {/* Tela cheia */}
+              <button
+                onClick={toggleFullScreen}
+                className="w-10 h-10 rounded-lg bg-gray-50 hover:bg-gray-100 border border-gray-200 text-gray-600 transition-colors"
+                aria-label={
+                  isFullScreen ? 'Sair da tela cheia' : 'Ativar tela cheia'
+                }
+                title={isFullScreen ? 'Sair da Tela Cheia' : 'Tela Cheia'}
+              >
+                <i
+                  className={`fas ${isFullScreen ? 'fa-compress' : 'fa-expand'} text-sm`}
+                  aria-hidden="true"
+                ></i>
+              </button>
+
+              {/* Atualizar manual */}
+              <button
+                onClick={fetchPedidos}
+                className="w-10 h-10 rounded-lg bg-gray-50 hover:bg-gray-100 border border-gray-200 text-gray-600 transition-colors active:scale-95"
+                title="Atualizar pedidos agora"
+                aria-label="Atualizar pedidos manualmente"
+              >
+                <i className="fas fa-sync-alt text-sm" aria-hidden="true"></i>
+              </button>
+
+              {/* Configurações */}
+              <button
+                ref={settingsButtonRef}
+                onClick={() => {
+                  setShowSettings(!showSettings)
+                  setShowFilters(false)
+                }}
+                className={`w-10 h-10 rounded-lg transition-all active:scale-95 border ${
+                  showSettings
+                    ? 'bg-[#7f22fe] text-white border-[#7f22fe] shadow-md'
+                    : 'bg-gray-50 hover:bg-gray-100 border-gray-200 text-gray-600'
+                }`}
+                aria-label="Abrir configurações"
+                aria-expanded={showSettings}
+                aria-controls="sidebar-configuracoes"
+              >
+                <i className="fas fa-cog text-sm" aria-hidden="true"></i>
+              </button>
+            </div>
+          </div>
+
+          {/* Busca mobile */}
+          <div className="lg:hidden px-4 pb-3">
+            <div className="relative">
+              <input
+                ref={mobileSearchRef}
+                type="text"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                placeholder="Pedido, cliente ou últimos dígitos do telefone..."
+                className="w-full pl-10 pr-4 py-2 rounded-lg bg-gray-50 border border-gray-300 text-sm focus:outline-none focus:border-[#7f22fe] focus:ring-2 focus:ring-[#7f22fe]/20"
+                aria-label="Buscar pedidos"
+              />
+              <i
+                className="fas fa-search absolute left-3 top-1/2 -translate-y-1/2 text-gray-400 text-sm"
+                aria-hidden="true"
+              ></i>
+              {searchQuery && (
+                <button
+                  onClick={() => setSearchQuery('')}
+                  className="absolute right-3 top-1/2 -translate-y-1/2 text-gray-400 hover:text-gray-600"
+                  aria-label="Limpar busca"
+                >
+                  <i className="fas fa-times text-sm" aria-hidden="true"></i>
+                </button>
+              )}
+            </div>
+          </div>
+
+          <OperationalAlertsBar alerts={operationalAlerts} />
+        </header>
+
+        {/* ── Corpo principal ────────────────────────────────────────────── */}
+        <div className="relative flex flex-1 min-h-0">
+
+          {/* Kanban Board */}
+          <main
+            className={`flex-1 p-6 overflow-x-auto overflow-y-hidden transition-all duration-300 bg-gray-50 ${
+              showSettings || showFilters ? 'mr-96' : ''
+            }`}
+            role="main"
+            aria-label="Quadro Kanban de pedidos"
+          >
+            <div
+              className={`grid gap-4 h-full min-h-0 auto-rows-fr transition-all ${
+                settings.aceitarAutomatico
+                  ? finishedColumnCollapsed
+                    ? 'grid-cols-[1fr_1fr_80px]'
+                    : 'grid-cols-[1fr_1fr_1fr]'
+                  : finishedColumnCollapsed
+                  ? 'grid-cols-[280px_1fr_1fr_80px]'
+                  : 'grid-cols-[280px_1fr_1fr_280px]'
+              }`}
+            >
+              {/* Coluna: Novos Pedidos (modo manual) */}
+              {!settings.aceitarAutomatico && (
+                <KanbanColumn
+                  title="Novos Pedidos"
+                  count={columns.pendente.length}
+                  color="purple"
+                  icon="bell"
+                  columnWidth="narrow"
+                  isAlerting={pendingAcceptCount > 0}
+                >
+                  {columns.pendente.map((p) => (
+                    <OrderCard
+                      key={p._id}
+                      pedido={p}
+                      onClick={() => setSelectedOrder(p)}
+                      onAdvance={() => advanceStatus(p)}
+                      onPrint={() => handlePrint(p)}
+                      printStatus={getVisiblePrintStatus(p._id)}
+                      color="purple"
+                      isLoading={loadingOrderId === p._id}
+                      searchQuery={searchQuery}
+                      visibleClusters={visibleClusters}
+                      toggleClusterPin={toggleClusterPin}
+                      columnWidth="narrow"
+                    />
+                  ))}
+                </KanbanColumn>
+              )}
+
+              {/* Coluna: Em Preparação */}
+              <KanbanColumn
+                title="Em Preparação"
+                count={columns.preparo.length}
+                color="orange"
+                icon="fire"
+                columnWidth="wide"
+              >
+                {columns.preparo.map((p) => (
+                  <OrderCard
+                    key={p._id}
+                    pedido={p}
+                    onClick={() => setSelectedOrder(p)}
+                    onAdvance={() => advanceStatus(p)}
+                    onPrint={() => handlePrint(p)}
+                    printStatus={getVisiblePrintStatus(p._id)}
+                    color="orange"
+                    isLoading={loadingOrderId === p._id}
+                    searchQuery={searchQuery}
+                    visibleClusters={visibleClusters}
+                    toggleClusterPin={toggleClusterPin}
+                    columnWidth="wide"
+                    restaurantAddress={settings.enderecoRestaurante}
+                    pedidos={pedidosComClusters}
+                  />
+                ))}
+              </KanbanColumn>
+
+              {/* Coluna: Em Entrega */}
+              <KanbanColumn
+                title="Em Entrega"
+                count={columns.entrega.length}
+                color="blue"
+                icon="shipping-fast"
+                columnWidth="wide"
+              >
+                {columns.entrega.map((p) => (
+                  <OrderCard
+                    key={p._id}
+                    pedido={p}
+                    onClick={() => setSelectedOrder(p)}
+                    onAdvance={() => advanceStatus(p)}
+                    onPrint={() => handlePrint(p)}
+                    printStatus={getVisiblePrintStatus(p._id)}
+                    color="blue"
+                    isLoading={loadingOrderId === p._id}
+                    searchQuery={searchQuery}
+                    visibleClusters={visibleClusters}
+                    toggleClusterPin={toggleClusterPin}
+                    columnWidth="wide"
+                    restaurantAddress={settings.enderecoRestaurante}
+                    pedidos={pedidosComClusters}
+                  />
+                ))}
+              </KanbanColumn>
+
+              {/* Coluna: Finalizados (colapsável) */}
+              <KanbanColumn
+                title="Finalizados"
+                count={columns.concluido.length}
+                color="emerald"
+                icon="check-circle"
+                isCollapsible={true}
+                isCollapsed={finishedColumnCollapsed}
+                onToggleCollapse={() =>
+                  setFinishedColumnCollapsed(!finishedColumnCollapsed)
+                }
+                columnWidth={finishedColumnCollapsed ? 'collapsed' : 'narrow'}
+              >
+                {columns.concluido.map((p) => (
+                  <OrderCard
+                    key={p._id}
+                    pedido={p}
+                    onClick={() => setSelectedOrder(p)}
+                    onPrint={() => handlePrint(p)}
+                    printStatus={getVisiblePrintStatus(p._id)}
+                    isDone
+                    color="emerald"
+                    searchQuery={searchQuery}
+                    visibleClusters={visibleClusters}
+                    toggleClusterPin={toggleClusterPin}
+                    columnWidth="narrow"
+                  />
+                ))}
+              </KanbanColumn>
+            </div>
+          </main>
+
+          {/* ── Sidebar: Filtros Avançados ──────────────────────────────── */}
+          <aside
+            ref={filtersPanelRef}
+            id="sidebar-filtros"
+            className={`absolute top-0 right-0 h-full w-96 bg-white border-l border-gray-200 shadow-xl transition-all duration-300 z-40 overflow-y-auto ${
+              showFilters && !showSettings ? 'translate-x-0' : 'translate-x-full'
+            }`}
+            aria-hidden={!(showFilters && !showSettings)}
+            aria-label="Painel de filtros avançados"
+          >
+            <div className="p-6 space-y-6">
+              <div className="flex items-center justify-between">
+                <h3 className="text-lg font-bold text-gray-900 flex items-center gap-2">
+                  <i
+                    className="fas fa-sliders-h text-[#7f22fe]"
+                    aria-hidden="true"
+                  ></i>
+                  Filtros Avançados
+                </h3>
+                {activeFiltersCount > 0 && (
+                  <button
+                    onClick={clearFilters}
+                    className="text-sm text-red-600 hover:text-red-700 font-bold"
+                    aria-label="Limpar todos os filtros ativos"
+                  >
+                    Limpar Tudo
+                  </button>
+                )}
+              </div>
+
+              {/* Tipo de pedido */}
+              <div className="space-y-2">
+                <label
+                  htmlFor="filtro-tipo"
+                  className="text-sm font-bold text-gray-700 uppercase tracking-wider block"
+                >
+                  Tipo de Pedido
+                </label>
+                <select
+                  id="filtro-tipo"
+                  value={filters.tipo}
+                  onChange={(e) =>
+                    setFilters({ ...filters, tipo: e.target.value })
+                  }
+                  className="w-full px-4 py-2.5 rounded-lg bg-gray-50 border border-gray-300 text-sm focus:border-[#7f22fe] focus:ring-2 focus:ring-[#7f22fe]/20 focus:outline-none"
+                >
+                  <option value={TIPO_PEDIDO_TODOS}>Todos os tipos</option>
+                  <option value={TIPO_PEDIDO_DELIVERY}>Delivery</option>
+                  <option value={TIPO_PEDIDO_BALCAO}>Balcão</option>
+                </select>
+              </div>
+
+              {/* Forma de pagamento */}
+              <div className="space-y-2">
+                <label
+                  htmlFor="filtro-pagamento"
+                  className="text-sm font-bold text-gray-700 uppercase tracking-wider block"
+                >
+                  Forma de Pagamento
+                </label>
+                <select
+                  id="filtro-pagamento"
+                  value={filters.pagamento}
+                  onChange={(e) =>
+                    setFilters({ ...filters, pagamento: e.target.value })
+                  }
+                  className="w-full px-4 py-2.5 rounded-lg bg-gray-50 border border-gray-300 text-sm focus:border-[#7f22fe] focus:ring-2 focus:ring-[#7f22fe]/20 focus:outline-none"
+                >
+                  <option value="todos">Todas as formas</option>
+                  <option value="pix">PIX</option>
+                  <option value="dinheiro">Dinheiro</option>
+                  <option value="cartao">Cartão</option>
+                  <option value="debito">Débito</option>
+                  <option value="credito">Crédito</option>
+                </select>
+              </div>
+
+              {/* Faixa de valor */}
+              <div className="space-y-2">
+                <label className="text-sm font-bold text-gray-700 uppercase tracking-wider block">
+                  Faixa de Valor
+                </label>
+                <div className="grid grid-cols-2 gap-3">
+                  <input
+                    type="number"
+                    placeholder="Min R$"
+                    value={filters.valorMin}
+                    onChange={(e) =>
+                      setFilters({ ...filters, valorMin: e.target.value })
+                    }
+                    className="px-3 py-2.5 rounded-lg bg-gray-50 border border-gray-300 text-sm focus:border-[#7f22fe] focus:ring-2 focus:ring-[#7f22fe]/20 focus:outline-none"
+                    aria-label="Valor mínimo do pedido"
+                    min="0"
+                  />
+                  <input
+                    type="number"
+                    placeholder="Máx R$"
+                    value={filters.valorMax}
+                    onChange={(e) =>
+                      setFilters({ ...filters, valorMax: e.target.value })
+                    }
+                    className="px-3 py-2.5 rounded-lg bg-gray-50 border border-gray-300 text-sm focus:border-[#7f22fe] focus:ring-2 focus:ring-[#7f22fe]/20 focus:outline-none"
+                    aria-label="Valor máximo do pedido"
+                    min="0"
+                  />
+                </div>
+              </div>
+
+              {/* Checkboxes de filtro */}
+              <div className="space-y-3 pt-4 border-t border-gray-200">
+                <FilterCheckbox
+                  checked={filters.apenasAgrupados}
+                  onChange={(val) =>
+                    setFilters({ ...filters, apenasAgrupados: val })
+                  }
+                  label="Apenas Pedidos Agrupados"
+                  icon="route"
+                  description="Mostrar só pedidos próximos entre si"
+                />
+                <FilterCheckbox
+                  checked={filters.apenasUrgentes}
+                  onChange={(val) =>
+                    setFilters({ ...filters, apenasUrgentes: val })
+                  }
+                  label="Apenas Pedidos Urgentes"
+                  icon="clock"
+                  description="Pedidos com mais de 30 minutos"
+                />
+                <FilterCheckbox
+                  checked={filters.apenasRecorrentes}
+                  onChange={(val) =>
+                    setFilters({ ...filters, apenasRecorrentes: val })
+                  }
+                  label="Apenas Clientes Recorrentes"
+                  icon="star"
+                  description="Clientes com 2+ pedidos"
+                />
+              </div>
+
+              {/* Resultado do filtro */}
+              <div className="p-4 rounded-lg bg-gray-50 border border-gray-200">
+                <p className="text-sm font-bold text-gray-700 mb-2">
+                  Resultados:
+                </p>
+                <div className="grid grid-cols-2 gap-2 text-sm">
+                  <div className="flex justify-between">
+                    <span className="text-gray-600">Filtrados:</span>
+                    <span className="font-bold">{pedidosFiltrados.length}</span>
+                  </div>
+                  <div className="flex justify-between">
+                    <span className="text-gray-600">Total:</span>
+                    <span className="font-bold text-gray-400">
+                      {pedidosComClusters.length}
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </aside>
+
+          {/* ── Sidebar: Configurações ─────────────────────────────────── */}
+          <aside
+            ref={settingsPanelRef}
+            id="sidebar-configuracoes"
+            className={`absolute top-0 right-0 h-full w-96 bg-white border-l border-gray-200 shadow-xl transition-all duration-300 z-40 overflow-y-auto ${
+              showSettings && !showFilters ? 'translate-x-0' : 'translate-x-full'
+            }`}
+            aria-hidden={!(showSettings && !showFilters)}
+            aria-label="Painel de configurações"
+          >
+            <div className="p-4 space-y-3">
+
+            {/* ── Operação ──────────────────────────────────────────────── */}
+            <AccordionSection id="acc-operacao" icon="store" title="Operação" defaultOpen={true}>
+              <div className="flex items-center justify-between p-4 rounded-lg bg-gray-50 border border-gray-200">
+                <div>
+                  <p className="text-sm text-gray-900 font-medium">Aceitar pedidos automaticamente</p>
+                  <p className="text-xs text-gray-500">Novos pedidos entram direto em preparação</p>
+                </div>
+                <Switch
+                  checked={settings.aceitarAutomatico}
+                  onChange={() => saveSettings({ ...settings, aceitarAutomatico: !settings.aceitarAutomatico })}
+                  ariaLabel="Ativar aceitação automática de pedidos"
+                />
+              </div>
+
+              <div className="flex items-center justify-between p-4 rounded-lg bg-gray-50 border border-gray-200">
+                <div>
+                  <p className="text-sm text-gray-900 font-medium">Aviso do sistema</p>
+                  <p className="text-xs text-gray-500">Mostra notificação quando chegar pedido</p>
+                </div>
+                <Switch checked={settings.notificacoesPush} onChange={handleToggleNotification} ariaLabel="Ativar notificações push" />
+              </div>
+
+              <div className="flex items-center justify-between p-4 rounded-lg bg-gray-50 border border-gray-200">
+                <div>
+                  <p className="text-sm text-gray-900 font-medium">Som ao receber pedido</p>
+                  <p className="text-xs text-gray-500">Toca alerta sonoro para novos pedidos</p>
+                </div>
+                <Switch
+                  checked={settings.somNotificacao}
+                  onChange={() => saveSettings({ ...settings, somNotificacao: !settings.somNotificacao })}
+                  ariaLabel="Ativar som ao receber pedido"
+                />
+              </div>
+            </AccordionSection>
+
+            {/* ── Impressão ─────────────────────────────────────────────── */}
+            <AccordionSection id="acc-impressao" icon="print" title="Impressão">
+
+              <label htmlFor="select-impressora" className="sr-only">Impressora automática</label>
+              <select
+                id="select-impressora"
+                value={settings.impressoraAutomatica}
+                onChange={(e) => saveSettings({ ...settings, impressoraAutomatica: e.target.value })}
+                className="w-full px-4 py-3 rounded-lg bg-gray-50 border border-gray-300 text-gray-900 text-sm focus:border-[#7f22fe] focus:ring-2 focus:ring-[#7f22fe]/20 focus:outline-none transition-all"
+              >
+                <option value="">Manual (sem impressão automática)</option>
+                {printers.map((p) => (
+                  <option key={p.name} value={p.name}>{p.name}</option>
+                ))}
+              </select>
+
+              {/* Estilo do cupom */}
+              <div className="rounded-lg border border-gray-200 overflow-hidden">
+                <div className="px-4 py-2.5 bg-gray-50 border-b border-gray-200">
+                  <p className="text-xs font-bold text-gray-500 uppercase tracking-wider flex items-center gap-1.5">
+                    <i className="fas fa-text-height text-gray-400" aria-hidden="true"></i>
+                    Estilo do Cupom
+                  </p>
+                </div>
+                <div className="p-4 space-y-4 bg-white">
+                  <div className="space-y-2">
+                    <p className="text-xs font-semibold text-gray-600">Tamanho da fonte</p>
+                    <div className="grid grid-cols-3 gap-2">
+                      {[
+                        { label: 'Pequeno', size: 10 },
+                        { label: 'Normal',  size: 12 },
+                        { label: 'Grande',  size: 15 },
+                      ].map(({ label, size }) => (
+                        <button
+                          key={size}
+                          onClick={() => saveSettings({ ...settings, fonteTamanho: size })}
+                          type="button"
+                          className={`py-3 rounded-lg border-2 transition-all text-center focus:outline-none focus:ring-2 focus:ring-[#7f22fe]/40 ${
+                            settings.fonteTamanho === size
+                              ? 'bg-[#7f22fe] border-[#7f22fe] text-white shadow-md'
+                              : 'bg-white border-gray-200 text-gray-700 hover:border-[#7f22fe]/40'
+                          }`}
+                          aria-pressed={settings.fonteTamanho === size}
+                        >
+                          <span className="block font-bold leading-tight" style={{ fontFamily: 'Courier New, monospace', fontSize: size }}>
+                            {label}
+                          </span>
+                          <span className={`block text-[10px] mt-0.5 ${settings.fonteTamanho === size ? 'text-purple-200' : 'text-gray-400'}`}>
+                            {size}px
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  <div className="flex items-center justify-between">
+                    <div>
+                      <p className="text-sm text-gray-900 font-medium">Negrito</p>
+                      <p className="text-xs text-gray-500">Letras mais fortes e marcadas</p>
+                    </div>
+                    <Switch
+                      checked={settings.negritar}
+                      onChange={() => saveSettings({ ...settings, negritar: !settings.negritar })}
+                      ariaLabel="Ativar texto em negrito no cupom"
+                    />
+                  </div>
+
+                  <button
+                    onClick={() => handlePrint(PEDIDO_TESTE_IMPRESSAO)}
+                    disabled={printingOrderIds.has(PEDIDO_TESTE_IMPRESSAO._id)}
+                    type="button"
+                    className="w-full py-2.5 rounded-lg border border-dashed border-gray-300 text-sm text-gray-500 hover:text-gray-700 hover:border-gray-400 hover:bg-gray-50 transition-all font-medium flex items-center justify-center gap-2 disabled:cursor-wait disabled:opacity-60"
+                  >
+                    <i
+                      className={`fas ${printingOrderIds.has(PEDIDO_TESTE_IMPRESSAO._id) ? 'fa-spinner fa-spin' : 'fa-print'} text-gray-400`}
+                      aria-hidden="true"
+                    ></i>
+                    {printingOrderIds.has(PEDIDO_TESTE_IMPRESSAO._id)
+                      ? 'Imprimindo...'
+                      : 'Imprimir cupom de teste'}
+                  </button>
+                </div>
+              </div>
+            </AccordionSection>
+
+            {/* ── Sistema ───────────────────────────────────────────────── */}
+            <AccordionSection id="acc-sistema" icon="sliders-h" title="Sistema">
+              <div className="p-4 rounded-lg bg-gray-50 border border-gray-200">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <p className="text-sm font-semibold text-gray-900">Sincronização de pedidos</p>
+                    <p className="text-xs text-gray-500 mt-1">Pedidos atualizados automaticamente a cada 10 segundos</p>
+                  </div>
+                  <span className="text-sm font-bold text-[#7f22fe] bg-purple-50 px-3 py-1 rounded-full border border-purple-200">
+                    {ORDER_REFRESH_SECONDS}s
+                  </span>
+                </div>
+              </div>
+
+              <div className="p-4 rounded-lg bg-gray-50 border border-gray-200">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <p className="text-sm font-semibold text-gray-900">Atualização do gestor</p>
+                    <p className="text-xs text-gray-500 mt-1">
+                      {updateState.status === 'ready'
+                        ? 'Nova versão baixada e pronta para instalar'
+                        : updateState.status === 'downloading'
+                        ? `Baixando atualização (${updateState.progress}%)`
+                        : `Versão atual v${packageInfo.version}`}
+                    </p>
+                  </div>
+                  {updateState.status === 'ready' ? (
+                    <button
+                      type="button"
+                      onClick={handleInstallUpdate}
+                      className="shrink-0 rounded-lg bg-[#7f22fe] px-3 py-2 text-xs font-bold text-white hover:bg-[#6b1de0]"
+                    >
+                      Atualizar
+                    </button>
+                  ) : (
+                    <span className={`shrink-0 text-xs font-bold px-3 py-1 rounded-full border ${
+                      updateState.status === 'downloading'
+                        ? 'bg-blue-50 text-blue-700 border-blue-200'
+                        : 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                    }`}>
+                      {updateState.status === 'downloading' ? 'Baixando' : 'Em dia'}
+                    </span>
+                  )}
+                </div>
+              </div>
+            </AccordionSection>
+
+            {/* ── Otimização de Entregas ────────────────────────────────── */}
+            <AccordionSection id="acc-entregas" icon="route" title="Otimização de Entregas">
+
+              <div className="flex items-center justify-between p-4 rounded-lg bg-gradient-to-r from-blue-50 to-cyan-50 border-2 border-blue-200">
+                <div className="flex-1">
+                  <div className="flex items-center gap-2 mb-1">
+                    <span className="text-sm text-gray-900 font-bold">Agrupar por Distância</span>
+                    <span className="text-xs bg-blue-500 text-white px-2 py-0.5 rounded-full font-bold">BETA</span>
+                  </div>
+                  <p className="text-xs text-gray-600">Destaca pedidos próximos para otimizar rotas</p>
+                </div>
+                <Switch
+                  checked={settings.agruparPorDistancia}
+                  onChange={() => saveSettings({ ...settings, agruparPorDistancia: !settings.agruparPorDistancia })}
+                  ariaLabel="Ativar agrupamento por distância"
+                />
+              </div>
+
+              {settings.agruparPorDistancia && (
+                <>
+                  <div className="p-5 rounded-lg bg-white border-2 border-blue-200">
+                    <div className="flex justify-between items-center mb-3">
+                      <div>
+                        <span className="text-sm font-bold text-gray-900 block">Raio de Proximidade</span>
+                        <span className="text-xs text-gray-500">Até quantos km considera próximo?</span>
+                      </div>
+                      <span className="text-lg font-black text-blue-600 bg-blue-50 px-3 py-1 rounded-lg border-2 border-blue-300">
+                        {settings.raioCluster}km
+                      </span>
+                    </div>
+                    <input
+                      type="range" min="0.5" max="10" step="0.5"
+                      value={settings.raioCluster}
+                      onChange={(e) => saveSettings({ ...settings, raioCluster: parseFloat(e.target.value) })}
+                      className="w-full h-2 bg-gradient-to-r from-blue-200 to-blue-400 rounded-lg appearance-none cursor-pointer slider-blue"
+                      aria-label={`Raio: ${settings.raioCluster}km`}
+                    />
+                    <div className="flex justify-between text-xs text-gray-500 mt-2 font-medium">
+                      <span>0.5km Restrito</span><span>10km Amplo</span>
+                    </div>
+                  </div>
+
+                  <div className="p-4 rounded-lg bg-white border-2 border-blue-100">
+                    <div className="flex justify-between items-center mb-3">
+                      <div>
+                        <span className="text-sm font-bold text-gray-900 block">
+                          <i className="fas fa-shopping-bag text-blue-500 mr-1"></i>Capacidade da Entrega
+                        </span>
+                        <span className="text-xs text-gray-500">Quantos pedidos o motoboy leva?</span>
+                      </div>
+                      <span className="text-sm font-black text-blue-700 bg-blue-100 px-2 py-1 rounded border border-blue-200">
+                        {settings.capacidadeEntrega} un.
+                      </span>
+                    </div>
+                    <input
+                      type="range" min="2" max="8" step="1"
+                      value={settings.capacidadeEntrega}
+                      onChange={(e) => saveSettings({ ...settings, capacidadeEntrega: parseInt(e.target.value) })}
+                      className="w-full h-2 bg-gradient-to-r from-blue-200 to-blue-400 rounded-lg appearance-none cursor-pointer slider-blue"
+                      aria-label={`Capacidade: ${settings.capacidadeEntrega} pedidos`}
+                    />
+                    <div className="flex justify-between text-xs text-gray-400 mt-2 font-medium">
+                      <span>2 (Mínimo)</span><span>8 (Mochila Cheia)</span>
+                    </div>
+                  </div>
+
+                  <div className="p-4 rounded-lg bg-white border-2 border-blue-100">
+                    <div className="flex justify-between items-center mb-3">
+                      <div>
+                        <span className="text-sm font-bold text-gray-900 block">
+                          <i className="fas fa-hourglass-half text-blue-500 mr-1"></i>Janela de Agrupamento
+                        </span>
+                        <span className="text-xs text-gray-500">Espera máx. do 1º pedido</span>
+                      </div>
+                      <span className="text-sm font-black text-blue-700 bg-blue-100 px-2 py-1 rounded border border-blue-200">
+                        {settings.tempoJanela} min
+                      </span>
+                    </div>
+                    <input
+                      type="range" min="10" max="60" step="5"
+                      value={settings.tempoJanela}
+                      onChange={(e) => saveSettings({ ...settings, tempoJanela: parseInt(e.target.value) })}
+                      className="w-full h-2 bg-gradient-to-r from-blue-200 to-blue-400 rounded-lg appearance-none cursor-pointer slider-blue"
+                      aria-label={`Janela: ${settings.tempoJanela} minutos`}
+                    />
+                    <div className="flex justify-between text-xs text-gray-400 mt-2 font-medium">
+                      <span>10min (Rápido)</span><span>60min (Econômico)</span>
+                    </div>
+                    <p className="mt-2 text-xs text-orange-600 bg-orange-50 p-2 rounded border border-orange-100">
+                      <i className="fas fa-exclamation-circle mr-1"></i>
+                      Pedidos antigos não esperarão mais que {settings.tempoJanela} min para sair.
+                    </p>
+                  </div>
+
+                  <div className="space-y-2">
+                    <label htmlFor="endereco-restaurante" className="text-sm font-bold text-gray-700 uppercase tracking-wider block">
+                      Endereço do Restaurante
+                    </label>
+                    <input
+                      id="endereco-restaurante"
+                      type="text"
+                      value={settings.enderecoRestaurante}
+                      onChange={(e) => saveSettings({ ...settings, enderecoRestaurante: e.target.value })}
+                      placeholder="Ex: Av. Paulista, 1578, São Paulo, SP"
+                      className="w-full px-4 py-2.5 rounded-lg bg-gray-50 border border-gray-300 text-sm focus:border-[#7f22fe] focus:ring-2 focus:ring-[#7f22fe]/20 focus:outline-none"
+                    />
+                    <p className="text-xs text-gray-500">Usado como ponto de partida nas rotas</p>
+                  </div>
+                </>
+              )}
+            </AccordionSection>
+
+            {/* ── Sobre ─────────────────────────────────────────────────── */}
+            <AccordionSection id="acc-sobre" icon="info-circle" title="Sobre">
+              <div className="p-4 rounded-xl bg-gray-50 border border-gray-200">
+                <div className="text-center mb-4">
+                  <div className="w-14 h-14 mx-auto mb-3 rounded-xl bg-[#7f22fe] flex items-center justify-center shadow-md">
+                    <i className="fas fa-pizza-slice text-2xl text-white" aria-hidden="true"></i>
+                  </div>
+                  <h4 className="font-bold text-gray-900 text-lg mb-1">
+                    Gestor Casa Mia
+                  </h4>
+                  <p className="text-sm text-gray-500">by Nadin Garcia</p>
+                </div>
+                <div className="space-y-2 text-sm">
+                  <div className="flex justify-between p-2 rounded bg-white border border-gray-100">
+                    <span className="text-gray-600">Versão:</span>
+                    <span className="text-gray-900 font-bold">v{packageInfo.version}</span>
+                  </div>
+                  <div className="flex justify-between p-2 rounded bg-white border border-gray-100">
+                    <span className="text-gray-600">Pedidos Hoje:</span>
+                    <span className="text-gray-900 font-bold">{pedidos.length}</span>
+                  </div>
+                </div>
+              </div>
+            </AccordionSection>
+
+            {/* ── Conta ─────────────────────────────────────────────────── */}
+            <AccordionSection id="acc-conta" icon="user-circle" title="Conta">
+              <div className="p-4 rounded-xl bg-gray-50 border border-gray-200">
+                <div className="flex items-start gap-3 mb-4">
+                  <div className="w-11 h-11 rounded-lg bg-[#7f22fe]/10 text-[#7f22fe] flex items-center justify-center shrink-0">
+                    <i className="fas fa-store" aria-hidden="true"></i>
+                  </div>
+                  <div className="min-w-0">
+                    <p className="text-xs font-bold uppercase tracking-wide text-gray-500">
+                      Restaurante logado
+                    </p>
+                    <p className="font-bold text-gray-900 truncate">
+                      {accountInfo.restaurante}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="space-y-2 text-sm">
+                  {accountInfo.cnpj && (
+                    <div className="flex justify-between gap-3 p-2 rounded bg-white border border-gray-100">
+                      <span className="text-gray-600">CNPJ:</span>
+                      <span className="text-gray-900 font-medium">{accountInfo.cnpj}</span>
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              <button
+                onClick={() => setShowLogoutConfirm(true)}
+                className="w-full py-3 rounded-lg bg-red-50 hover:bg-red-100 border border-red-200 text-red-600 hover:text-red-700 font-bold transition-all uppercase tracking-wider text-sm"
+                type="button"
+              >
+                <i className="fas fa-sign-out-alt mr-2" aria-hidden="true"></i>
+                Encerrar Sessão
+              </button>
+              <button
+                onClick={() => setShowClearDataConfirm(true)}
+                className="w-full py-3 rounded-lg bg-gray-50 hover:bg-gray-100 border border-gray-200 text-gray-600 hover:text-gray-800 font-bold transition-all uppercase tracking-wider text-sm"
+                type="button"
+              >
+                <i className="fas fa-broom mr-2" aria-hidden="true"></i>
+                Limpar Cache e Dados Locais
+              </button>
+            </AccordionSection>
+
+          </div>
+          </aside>
+        </div>
+
+        {/* Modal do pedido */}
+        {selectedOrder && (
+          <OrderModal
+            pedido={selectedOrder}
+            onClose={() => setSelectedOrder(null)}
+            onPrint={(pedidoAtual) => handlePrint(pedidoAtual || selectedOrder)}
+            printStatus={getVisiblePrintStatus(selectedOrder._id)}
+            onAdvance={advanceStatus}
+            onConfirmPayment={confirmPixPayment}
+            onCheckPayment={checkPixPayment}
+            onCancelOrder={cancelPixOrder}
+            isLoading={loadingOrderId === selectedOrder._id}
+            pedidos={pedidosComClusters}
+            onNavigate={setSelectedOrder}
+            restaurantAddress={settings.enderecoRestaurante}
+          />
+        )}
+
+        {showLogoutConfirm && (
+          <LogoutConfirmModal
+            onConfirm={handleConfirmLogout}
+            onClose={() => setShowLogoutConfirm(false)}
+          />
+        )}
+
+        {showClearDataConfirm && (
+          <ClearLocalDataModal
+            onConfirm={handleClearLocalData}
+            onClose={() => setShowClearDataConfirm(false)}
+          />
+        )}
+
+        {/* Sistema de toasts */}
+         <ToastContainer toasts={toasts} onDismiss={removeToast} />
+
+        {/* Cards flutuantes de clusters fixados */}
+        {uniqueClusters
+          .filter((c) => visibleClusters.includes(c.clusterId))
+          .map((cluster) => (
+            <ClusterFloatingCard
+              key={cluster.clusterId}
+              cluster={cluster}
+              pedidos={pedidosComClusters}
+              onAdvanceCluster={() => advanceCluster(cluster.clusterId)}
+              onOrderClick={setSelectedOrder}
+              onClose={() => toggleClusterPin(cluster.clusterId)}
+            />
+          ))}
+          <ElectronBanner />
+      </div>
+    </TickProvider>
+  )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SKELETON DE LOADING
+// Exibido enquanto o primeiro fetch está em andamento.
+// Elimina a tela em branco que parecia um erro para o operador.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function KanbanSkeleton({ hasNewOrdersColumn = false }) {
+  const colCount = hasNewOrdersColumn ? 4 : 3
+
+  return (
+    <div
+      className="min-h-screen bg-white flex flex-col"
+      role="status"
+      aria-label="Carregando pedidos..."
+      aria-busy="true"
+    >
+      {/* Header skeleton */}
+      <div className="h-[81px] bg-white border-b border-gray-200 shadow-sm flex items-center px-4 gap-4">
+        <div className="w-10 h-10 rounded-lg bg-gray-200 animate-pulse" />
+        <div className="space-y-2">
+          <div className="h-4 w-40 bg-gray-200 rounded animate-pulse" />
+          <div className="h-3 w-24 bg-gray-100 rounded animate-pulse" />
+        </div>
+        <div className="flex-1 max-w-md hidden lg:block">
+          <div className="h-9 bg-gray-100 rounded-lg animate-pulse" />
+        </div>
+        <div className="ml-auto flex gap-3">
+          {[0, 1, 2].map((i) => (
+            <div
+              key={i}
+              className="w-10 h-10 rounded-lg bg-gray-100 animate-pulse"
+            />
+          ))}
+        </div>
+      </div>
+
+      {/* Kanban skeleton */}
+      <div
+        className="flex-1 p-6 bg-gray-50 grid gap-4"
+        style={{
+          gridTemplateColumns: `repeat(${colCount}, 1fr)`,
+        }}
+      >
+        {Array.from({ length: colCount }).map((_, colIdx) => (
+          <div
+            key={colIdx}
+            className="rounded-xl bg-gray-100/50 border border-gray-200 overflow-hidden"
+          >
+            {/* Cabeçalho da coluna */}
+            <div className="px-4 py-3 bg-white border-b-2 border-gray-200 flex items-center justify-between">
+              <div className="h-4 w-28 bg-gray-200 rounded animate-pulse" />
+              <div className="h-6 w-8 bg-gray-200 rounded-md animate-pulse" />
+            </div>
+            {/* Cards skeleton */}
+            <div className="p-3 space-y-3">
+              {Array.from({ length: colIdx === 0 ? 2 : 3 }).map((_, cardIdx) => (
+                <div
+                  key={cardIdx}
+                  className="bg-white rounded-lg p-3 border border-l-4 border-l-gray-300 space-y-2 animate-pulse"
+                >
+                  <div className="flex justify-between">
+                    <div className="h-3 w-16 bg-gray-200 rounded" />
+                    <div className="h-3 w-14 bg-gray-200 rounded" />
+                  </div>
+                  <div className="h-3 w-32 bg-gray-100 rounded" />
+                  <div className="flex gap-2">
+                    <div className="h-4 w-16 bg-gray-100 rounded" />
+                    <div className="h-4 w-20 bg-gray-100 rounded" />
+                  </div>
+                  <div className="space-y-1">
+                    <div className="h-2.5 w-full bg-gray-100 rounded" />
+                    <div className="h-2.5 w-3/4 bg-gray-100 rounded" />
+                  </div>
+                  <div className="h-8 bg-gray-200 rounded mt-1" />
+                </div>
+              ))}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Switch — toggle acessível
+// ─────────────────────────────────────────────────────────────────────────────
+
+function Switch({ checked, onChange, ariaLabel }) {
+  return (
+    <button
+      onClick={onChange}
+      className={`relative w-12 h-6 rounded-full transition-colors focus:outline-none focus:ring-2 focus:ring-[#7f22fe]/40 focus:ring-offset-1 ${
+        checked ? 'bg-[#7f22fe]' : 'bg-gray-300'
+      }`}
+      role="switch"
+      aria-checked={checked}
+      aria-label={ariaLabel}
+      type="button"
+    >
+      <span
+        className={`absolute top-0.5 left-0.5 w-5 h-5 bg-white rounded-full transition-transform shadow-sm ${
+          checked ? 'translate-x-6' : 'translate-x-0'
+        }`}
+        aria-hidden="true"
+      />
+    </button>
+  )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// FilterCheckbox — checkbox estilizado com ícone e descrição
+// ─────────────────────────────────────────────────────────────────────────────
+
+function FilterCheckbox({ checked, onChange, label, icon, description }) {
+  return (
+    <button
+      onClick={() => onChange(!checked)}
+      className={`w-full p-4 rounded-lg border-2 transition-all text-left focus:outline-none focus:ring-2 focus:ring-[#7f22fe]/40 ${
+        checked
+          ? 'bg-[#7f22fe]/10 border-[#7f22fe]'
+          : 'bg-gray-50 border-gray-200 hover:border-gray-300'
+      }`}
+      role="checkbox"
+      aria-checked={checked}
+      aria-label={label}
+      type="button"
+    >
+      <div className="flex items-start gap-3">
+        <div
+          className={`w-5 h-5 rounded border-2 flex items-center justify-center shrink-0 mt-0.5 transition-colors ${
+            checked
+              ? 'bg-[#7f22fe] border-[#7f22fe]'
+              : 'bg-white border-gray-300'
+          }`}
+          aria-hidden="true"
+        >
+          {checked && (
+            <i className="fas fa-check text-white text-sm"></i>
+          )}
+        </div>
+        <div className="flex-1">
+          <div className="flex items-center gap-2 mb-1">
+            <i
+              className={`fas fa-${icon} text-sm ${
+                checked ? 'text-[#7f22fe]' : 'text-gray-500'
+              }`}
+              aria-hidden="true"
+            ></i>
+            <span
+              className={`text-sm font-bold ${
+                checked ? 'text-[#7f22fe]' : 'text-gray-900'
+              }`}
+            >
+              {label}
+            </span>
+          </div>
+          <p className="text-sm text-gray-600">{description}</p>
+        </div>
+      </div>
+    </button>
+  )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// KanbanColumn — coluna do quadro Kanban com suporte a colapso
+// ─────────────────────────────────────────────────────────────────────────────
+
+function KanbanColumn({
+  title,
+  count,
+  children,
+  color,
+  icon,
+  isCollapsible,
+  isCollapsed,
+  onToggleCollapse,
+  columnWidth = 'normal',
+  isAlerting = false,
+}) {
+  const colorThemes = {
+    purple: 'border-[#7f22fe] bg-purple-50',
+    orange: 'border-orange-500 bg-orange-50',
+    blue: 'border-blue-500 bg-blue-50',
+    emerald: 'border-emerald-500 bg-emerald-50',
+  }
+
+  const textColors = {
+    purple: 'text-[#7f22fe]',
+    orange: 'text-orange-600',
+    blue: 'text-blue-600',
+    emerald: 'text-emerald-600',
+  }
+
+  const borderColor = colorThemes[color]?.split(' ')[0] || ''
+  const bgColor = colorThemes[color]?.split(' ')[1] || ''
+
+  return (
+    <div
+      className={`flex flex-col h-full rounded-xl bg-gray-100/50 border overflow-hidden shadow-sm transition-all ${
+        isAlerting ? 'border-rose-400 animate-pulse-glow' : 'border-gray-200'
+      } ${isCollapsed ? 'max-w-[80px]' : ''}`}
+      role="region"
+      aria-label={`Coluna ${title}: ${count} pedidos${isAlerting ? '. Aguardando aceite' : ''}`}
+    >
+      {/* Cabeçalho da coluna */}
+      <div
+        className={`px-4 py-3 border-b-2 bg-white flex justify-between items-center ${borderColor} ${
+          isCollapsible ? 'cursor-pointer hover:bg-gray-50' : ''
+        }`}
+        onClick={isCollapsible ? onToggleCollapse : undefined}
+        role={isCollapsible ? 'button' : undefined}
+        aria-expanded={isCollapsible ? !isCollapsed : undefined}
+        tabIndex={isCollapsible ? 0 : undefined}
+        onKeyDown={
+          isCollapsible
+            ? (e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault()
+                  onToggleCollapse()
+                }
+              }
+            : undefined
+        }
+      >
+        <div
+          className={`font-bold flex items-center gap-2 ${textColors[color]}`}
+        >
+          <div
+            className={`p-1.5 rounded-md ${bgColor} bg-opacity-50`}
+            aria-hidden="true"
+          >
+            <i className={`fas fa-${icon}`}></i>
+          </div>
+          {!isCollapsed && (
+            <span className="uppercase tracking-tight text-sm">{title}</span>
+          )}
+        </div>
+        <div className="flex items-center gap-2">
+          <span
+            className="bg-gray-800 px-2.5 py-0.5 rounded-md text-sm font-bold text-white"
+            aria-hidden="true"
+          >
+            {count}
+          </span>
+          {isCollapsible && (
+            <i
+              className={`fas fa-chevron-${isCollapsed ? 'right' : 'left'} text-sm`}
+              aria-hidden="true"
+            ></i>
+          )}
+        </div>
+      </div>
+
+      {/* Conteúdo scrollável */}
+      {!isCollapsed && (
+        <div className="flex-1 p-3 overflow-y-auto overflow-x-hidden custom-scrollbar">
+          {children.length > 0 ? (
+            <div
+              className={`grid gap-3 ${
+                columnWidth === 'wide'
+                  ? 'grid-cols-1 2xl:grid-cols-2'
+                  : 'grid-cols-1'
+              }`}
+            >
+              {children}
+            </div>
+          ) : (
+            <div className="h-full flex flex-col items-center justify-center opacity-40">
+              <i
+                className={`fas fa-${icon} text-3xl mb-2`}
+                aria-hidden="true"
+              ></i>
+              <span className="text-sm font-medium">Vazio</span>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OrderCard — card individual do Kanban
+// ─────────────────────────────────────────────────────────────────────────────
+
+function OrderCard({
+  pedido,
+  onClick,
+  onAdvance,
+  onPrint,
+  printStatus,
+  isDone,
+  color,
+  isLoading,
+  searchQuery,
+  visibleClusters,
+  toggleClusterPin,
+}) {
+  const colorThemes = {
+    purple: 'border-l-4 border-l-[#7f22fe]',
+    orange: 'border-l-4 border-l-orange-500',
+    blue: 'border-l-4 border-l-blue-500',
+    emerald: 'border-l-4 border-l-emerald-500 opacity-60 grayscale-[0.5]',
+  }
+
+  const now = useTick()
+  const inicioContagem = getInicioContagem(pedido)
+  const agendado = isAgendado(pedido)
+  const aguardandoHorario = isAguardandoHorario(pedido, now)
+  const { minutes, isUrgent } = getTimeElapsed(inicioContagem, now)
+  const countdown = useCountdown(inicioContagem, getPrazoMinutos(pedido))
+  const discountInfo = getDiscountInfo(pedido)
+  const orderAction = getOrderAction(pedido)
+  const printInfo = getPrintStatusInfo(printStatus)
+  const paymentInfo = getPaymentInfo(pedido)
+  const hasObservation = hasOrderObservation(pedido)
+
+  // Monta o tooltip do countdown com contexto claro para o operador
+  const countdownTooltip = countdown.isLate
+    ? `Pedido atrasado! Passou ${countdown.overdueMinutes} min além do estimado`
+    : countdown.isWarning
+    ? `Atenção: menos de 10 minutos restantes (${countdown.display})`
+    : `Tempo estimado restante: ${countdown.display}`
+  const agendadoTooltip = aguardandoHorario
+    ? `Agendado para ${formatTime(pedido.horarioEntrega)}. Começar o preparo às ${formatTime(inicioContagem)}.`
+    : `Agendado para ${formatTime(pedido.horarioEntrega)}. Já está na hora do preparo.`
+
+  // Highlight do termo buscado no texto do card
+  const highlightText = (text) => {
+    if (!searchQuery || !text) return text
+    const escapedQuery = searchQuery.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const parts = String(text).split(new RegExp(`(${escapedQuery})`, 'gi'))
+    return parts.map((part, i) =>
+      part.toLowerCase() === searchQuery.toLowerCase() ? (
+        <mark key={i} className="bg-yellow-200 px-0.5 rounded">
+          {part}
+        </mark>
+      ) : (
+        part
+      )
+    )
+  }
+
+  return (
+    <div
+      onClick={onClick}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault()
+          onClick()
+        }
+      }}
+      className={`relative bg-white p-3 rounded-lg shadow-sm hover:shadow-md hover:-translate-y-0.5 active:scale-[0.98] transition-all cursor-pointer border group flex flex-col gap-2 focus:outline-none focus:ring-2 focus:ring-[#7f22fe]/40 ${
+        colorThemes[color]
+      } ${isUrgent && !isDone ? 'ring-1 ring-red-400/60' : ''}`}
+      role="button"
+      tabIndex={0}
+      aria-label={`Pedido #${getOrderNumber(pedido)} — ${pedido.cliente?.nome || 'Consumidor'} — ${pedido.status || 'Recebido'} — ${formatCurrency(pedido.total)}`}
+    >
+      {/* Linha 1: ID · Hora · Countdown · Total */}
+      <div className="flex items-center gap-1.5 flex-wrap">
+        <span className="text-sm font-black text-gray-900">
+          #{highlightText(getOrderNumber(pedido))}
+        </span>
+        <span className="text-[10px] text-gray-400">
+          {formatTime(pedido.createdAt)}
+        </span>
+
+        {agendado && !isDone && (
+          <span
+            className={`inline-flex items-center gap-1 text-[10px] font-black px-1.5 py-0.5 rounded shrink-0 cursor-help ${
+              aguardandoHorario
+                ? 'bg-indigo-100 text-indigo-700'
+                : 'bg-indigo-600 text-white'
+            }`}
+            title={agendadoTooltip}
+            aria-label={agendadoTooltip}
+          >
+            <i className="fas fa-calendar-check text-[9px]" aria-hidden="true"></i>
+            {formatTime(pedido.horarioEntrega)}
+          </span>
+        )}
+
+        {!isDone && !aguardandoHorario && (
+          <span
+            className={`text-[10px] font-black px-1.5 py-0.5 rounded font-mono shrink-0 cursor-help ${
+              countdown.isLate
+                ? 'bg-red-100 text-red-600'
+                : countdown.isWarning
+                ? 'bg-yellow-100 text-yellow-700'
+                : 'bg-gray-100 text-gray-500'
+            }`}
+            title={countdownTooltip}
+            aria-label={countdownTooltip}
+          >
+            {countdown.isLate ? `⚠ ${countdown.overdueMinutes}min ATRASADO` : countdown.display}
+          </span>
+        )}
+
+        {isUrgent && !isDone && (
+          <span
+            className="text-[10px] font-black px-1.5 py-0.5 rounded bg-red-500 text-white shrink-0"
+            aria-label={`Pedido aguarda há ${minutes} minutos`}
+            title={`Pedido aguarda há ${minutes} minutos`}
+          >
+            {minutes}m
+          </span>
+        )}
+
+        <span className="ml-auto text-sm font-black text-gray-900 whitespace-nowrap">
+          {formatCurrency(pedido.total)}
+        </span>
+      </div>
+
+      {/* Linha 2: Nome do cliente */}
+      <div className="flex items-center gap-1.5">
+        <p className="text-sm font-bold text-gray-900 truncate flex-1">
+          {highlightText(pedido.cliente?.nome || 'Consumidor')}
+        </p>
+        {pedido.cliente?.totalPedidos > 1 && (
+          <span
+            className="text-[10px] text-emerald-600 font-bold shrink-0"
+            title={`Cliente fiel — ${pedido.cliente.totalPedidos}º pedido`}
+          >
+            ★{pedido.cliente.totalPedidos}
+          </span>
+        )}
+      </div>
+
+      {/* Indicadores operacionais compactos */}
+      <div className="flex items-center gap-1 flex-wrap">
+        <span
+          className={`inline-flex items-center gap-1 px-1.5 py-0.5 rounded border text-[10px] font-bold shrink-0 ${
+            isDelivery(pedido)
+              ? 'bg-blue-50 text-blue-700 border-blue-200'
+              : 'bg-orange-50 text-orange-700 border-orange-200'
+          }`}
+        >
+          <i
+            className={`fas ${
+              isDelivery(pedido) ? 'fa-motorcycle' : 'fa-store'
+            } text-[9px]`}
+            aria-hidden="true"
+          ></i>
+          {getTipoPedidoLabel(pedido.tipo)}
+        </span>
+
+        <span
+          className={`inline-flex min-w-0 max-w-full items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] font-black ${paymentInfo.className}`}
+          title={paymentInfo.label}
+        >
+          <i className={`fas ${paymentInfo.icon} text-[9px]`} aria-hidden="true"></i>
+          <span className="truncate">{paymentInfo.shortLabel || paymentInfo.label}</span>
+        </span>
+
+        {hasObservation && (
+          <span
+            className="inline-flex items-center gap-1 rounded border border-amber-300 bg-amber-100 px-1.5 py-0.5 text-[10px] font-black text-amber-900"
+            title="Este pedido possui observação em um ou mais itens"
+          >
+            <i className="fas fa-comment-dots text-[9px]" aria-hidden="true"></i>
+            OBSERVAÇÃO
+          </span>
+        )}
+
+        {discountInfo && (
+          <span
+            className={`inline-flex min-w-0 max-w-full items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] ${
+              discountInfo.isCampaign
+                ? 'bg-violet-50 border-violet-200 text-violet-700'
+                : 'bg-emerald-50 border-emerald-200 text-emerald-700'
+            }`}
+            title={discountInfo.label}
+          >
+            <i className="fas fa-tag text-[9px]" aria-hidden="true"></i>
+            <span className="truncate font-bold">{discountInfo.shortLabel}</span>
+            <span className="shrink-0 font-black">-{formatCurrency(pedido.desconto)}</span>
+          </span>
+        )}
+
+        {!isDone && (printStatus?.status === 'failed' ? (
+          <button
+            type="button"
+            onClick={(event) => {
+              event.stopPropagation()
+              onPrint()
+            }}
+            className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] font-black hover:brightness-95 ${printInfo.className}`}
+            title={`${printStatus?.error || printInfo.label}. Clique para tentar novamente.`}
+          >
+            <i className="fas fa-rotate text-[9px]" aria-hidden="true"></i>
+            {printInfo.shortLabel}
+          </button>
+        ) : (
+          <span
+            className={`inline-flex items-center gap-1 rounded border px-1.5 py-0.5 text-[10px] font-bold ${printInfo.className}`}
+            title={printInfo.label}
+          >
+            <i className={`fas ${printInfo.icon} text-[9px]`} aria-hidden="true"></i>
+            {printInfo.shortLabel}
+          </span>
+        ))}
+      </div>
+
+      {/* Linha 4: Endereço (só Delivery) */}
+      {isDelivery(pedido) && pedido.enderecoEntrega && (
+        <div className="flex items-start gap-1">
+          <i
+            className="fas fa-map-marker-alt text-[9px] text-gray-400 mt-0.5 shrink-0"
+            aria-hidden="true"
+          ></i>
+          <span className="text-[10px] text-gray-500 leading-tight line-clamp-1">
+            {pedido.enderecoEntrega.rua}, {pedido.enderecoEntrega.numero}
+            {pedido.enderecoEntrega.bairro
+              ? ` · ${pedido.enderecoEntrega.bairro}`
+              : ''}
+          </span>
+        </div>
+      )}
+
+      {/* Badge de cluster */}
+      {pedido.clusterId && pedido.clusterSize > 1 && (
+        <div
+          className={`flex items-center gap-1.5 px-2 py-1 rounded ${pedido.clusterColor.bg} ${pedido.clusterColor.border} border`}
+        >
+          <div
+            className={`w-4 h-4 rounded-full ${pedido.clusterColor.badge} flex items-center justify-center text-white font-black text-[9px] shrink-0`}
+            aria-hidden="true"
+          >
+            {pedido.clusterSize}
+          </div>
+          <p
+            className={`text-[10px] font-bold flex-1 ${pedido.clusterColor.text}`}
+          >
+            Rota Compartilhada
+          </p>
+          <button
+            onClick={(e) => {
+              e.stopPropagation()
+              toggleClusterPin(pedido.clusterId)
+            }}
+            className={`w-5 h-5 rounded flex items-center justify-center text-[10px] transition-all ${
+              visibleClusters.includes(pedido.clusterId)
+                ? `${pedido.clusterColor.badge} text-white`
+                : 'bg-white hover:bg-gray-100'
+            }`}
+            title={
+              visibleClusters.includes(pedido.clusterId)
+                ? 'Desafixar painel do cluster'
+                : 'Fixar painel do cluster'
+            }
+            aria-label={
+              visibleClusters.includes(pedido.clusterId)
+                ? 'Desafixar painel do grupo de rotas'
+                : 'Fixar painel do grupo de rotas'
+            }
+            type="button"
+          >
+            <i className="fas fa-thumbtack" aria-hidden="true"></i>
+          </button>
+        </div>
+      )}
+
+      {/* Itens do pedido (máx 2 visíveis) */}
+      <div className="space-y-0.5">
+        {pedido.itens.slice(0, 2).map((item, idx) => (
+          <div key={idx} className="flex items-start gap-1">
+            <span className="text-[10px] font-black text-gray-600 min-w-[18px]">
+              {item.quantidade}x
+            </span>
+            <span className="text-[10px] text-gray-700 truncate">
+              {item.nome.replace(/\s*\(padrão\)/gi, '').trim()}
+            </span>
+          </div>
+        ))}
+        {pedido.itens.length > 2 && (
+          <p className="text-[9px] text-gray-400">
+            +{pedido.itens.length - 2}{' '}
+            {pedido.itens.length - 2 === 1 ? 'item' : 'itens'}
+          </p>
+        )}
+      </div>
+
+      {/* Ações (não exibidas em pedidos finalizados) — alvos de toque ≥40px */}
+      {!isDone && (
+        <div className="flex gap-2 pt-2 border-t border-gray-100 mt-auto">
+          <button
+            onClick={(e) => {
+              e.stopPropagation()
+              onPrint()
+            }}
+            disabled={printStatus?.status === 'printing'}
+            className={`rounded-lg p-3 text-base transition-colors focus:outline-none focus:ring-2 ${
+              printStatus?.status === 'printing'
+                ? 'cursor-wait bg-violet-100 text-violet-700'
+                : printStatus?.status === 'failed'
+                ? 'bg-red-100 text-red-700 hover:bg-red-200 focus:ring-red-400/40'
+                : 'text-gray-400 hover:bg-gray-100 hover:text-gray-600 focus:ring-gray-400/40'
+            }`}
+            title={
+              printStatus?.status === 'printing'
+                ? 'Imprimindo pedido'
+                : printStatus?.status === 'failed'
+                ? 'Tentar imprimir novamente'
+                : 'Imprimir cupom'
+            }
+            aria-label={
+              printStatus?.status === 'printing'
+                ? 'Imprimindo pedido'
+                : printStatus?.status === 'failed'
+                ? 'Tentar imprimir o pedido novamente'
+                : 'Imprimir cupom do pedido'
+            }
+            type="button"
+          >
+            <i
+              className={`fas ${
+                printStatus?.status === 'printing'
+                  ? 'fa-spinner fa-spin'
+                  : printStatus?.status === 'failed'
+                  ? 'fa-rotate'
+                  : 'fa-print'
+              }`}
+              aria-hidden="true"
+            ></i>
+          </button>
+          <button
+            onClick={(e) => {
+              e.stopPropagation()
+              onAdvance()
+            }}
+            disabled={isLoading}
+            className={`flex-1 py-3 rounded-lg text-sm font-black text-white transition-all active:scale-95 focus:outline-none focus:ring-2 focus:ring-gray-900/40 ${
+              isLoading
+                ? 'bg-gray-400 cursor-not-allowed'
+                : 'bg-gray-900 hover:bg-black'
+            }`}
+            aria-label={
+              isLoading
+                ? orderAction?.loadingLabel || 'Atualizando status...'
+                : orderAction?.label || 'Atualizar pedido'
+            }
+            type="button"
+          >
+            {isLoading ? (
+              <i className="fas fa-spinner fa-spin" aria-hidden="true"></i>
+            ) : (
+              <>
+                {orderAction?.shortLabel || 'ATUALIZAR'}{' '}
+                <i
+                  className={`fas ${orderAction?.icon || 'fa-arrow-right'} text-xs ml-1`}
+                  aria-hidden="true"
+                ></i>
+              </>
+            )}
+          </button>
+        </div>
+      )}
+    </div>
+  )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// OrderModal — modal de detalhes do pedido com navegação intra-cluster
+// ─────────────────────────────────────────────────────────────────────────────
+
+function OrderModal({
+  pedido,
+  onClose,
+  onPrint,
+  printStatus,
+  onAdvance,
+  onConfirmPayment,
+  onCheckPayment,
+  onCancelOrder,
+  isLoading,
+  pedidos,
+  onNavigate,
+  restaurantAddress,
+}) {
+  const [currentPedido, setCurrentPedido] = useState(pedido)
+  const discountInfo = getDiscountInfo(currentPedido)
+  const orderAction = getOrderAction(currentPedido)
+  const printInfo = getPrintStatusInfo(printStatus)
+  const modalPaymentInfo = getPaymentInfo(currentPedido)
+  const itemCount = (currentPedido.itens || []).reduce(
+    (total, item) => total + Number(item.quantidade || 0),
+    0
+  )
+
+  // Focus trap com suporte a fechar via Escape
+  const modalRef = useFocusTrap(true, onClose)
+
+  // Sincroniza com pedido externo (ex: avançar status abre o modal no novo estado)
+  useEffect(() => {
+    setCurrentPedido(pedido)
+  }, [pedido])
+
+  const handleWhatsApp = () => {
+    if (!currentPedido.cliente?.telefone) return
+    const phone = currentPedido.cliente.telefone.replace(/\D/g, '')
+    const fullPhone = phone.length <= 11 ? `55${phone}` : phone
+    const msg = `Olá ${currentPedido.cliente.nome}, tudo bem? Aqui é da Pizzaria Casa Mia. Estamos entrando em contato sobre seu pedido #${getOrderNumber(currentPedido)}.`
+    window.open(
+      `https://wa.me/${fullPhone}?text=${encodeURIComponent(msg)}`,
+      '_blank'
+    )
+  }
+
+  const openGoogleMaps = () => {
+    if (!currentPedido.enderecoEntrega) return
+    const { rua, numero, bairro, cidade } = currentPedido.enderecoEntrega
+    const address = `${rua}, ${numero}, ${bairro}, ${cidade}`
+    window.open(
+      `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(address)}`,
+      '_blank'
+    )
+  }
+
+  const createClusterRoute = () => {
+    if (!currentPedido?.clusterId || !pedidos?.length) return
+
+    const clusterOrders = pedidos
+      .filter((p) => p.clusterId === currentPedido.clusterId && p.enderecoEntrega)
+      .sort((a, b) => new Date(a.createdAt) - new Date(b.createdAt))
+
+    if (clusterOrders.length === 0) return
+
+    const origin = restaurantAddress || 'Av. Paulista, 1578, São Paulo, SP'
+
+    const lastAddr =
+      clusterOrders[clusterOrders.length - 1].enderecoEntrega
+    const destination = `${lastAddr.rua}, ${lastAddr.numero}, ${lastAddr.bairro}, ${lastAddr.cidade}`
+
+    const waypoints = clusterOrders
+      .slice(0, -1)
+      .map((p) => {
+        const addr = p.enderecoEntrega
+        return `${addr.rua}, ${addr.numero}, ${addr.bairro}, ${addr.cidade}`
+      })
+      .join('|')
+
+    const mapsUrl =
+      `https://www.google.com/maps/dir/?api=1` +
+      `&origin=${encodeURIComponent(origin)}` +
+      `&destination=${encodeURIComponent(destination)}` +
+      (waypoints ? `&waypoints=${encodeURIComponent(waypoints)}` : '') +
+      `&travelmode=driving`
+
+    window.open(mapsUrl, '_blank')
+  }
+
+  const navigateToOrder = (orderId) => {
+    const nextPedido = pedidos.find((p) => p._id === orderId)
+    if (nextPedido) {
+      setCurrentPedido(nextPedido)
+      onNavigate(nextPedido)
+    }
+  }
+
+  // Navegação prev/next dentro do cluster
+  const clusterOrders =
+    pedidos?.filter((p) => p.clusterId === currentPedido.clusterId) || []
+  const currentIndexInCluster = clusterOrders.findIndex(
+    (p) => p._id === currentPedido._id
+  )
+  const hasPrev = currentIndexInCluster > 0
+  const hasNext = currentIndexInCluster < clusterOrders.length - 1
+
+  const goToPrev = () => {
+    if (hasPrev) {
+      const prev = clusterOrders[currentIndexInCluster - 1]
+      setCurrentPedido(prev)
+      onNavigate(prev)
+    }
+  }
+
+  const goToNext = () => {
+    if (hasNext) {
+      const next = clusterOrders[currentIndexInCluster + 1]
+      setCurrentPedido(next)
+      onNavigate(next)
+    }
+  }
+
+  const { minutes } = getTimeElapsed(currentPedido.createdAt)
+  const aguardandoHorario = isAguardandoHorario(currentPedido)
+
+  const handleAdvance = async () => {
+    if (isLoading) return
+    const result = await onAdvance(currentPedido)
+    if (result?.success || result?.deferred) onClose()
+  }
+
+  // Ações do Pix que mexem no pedido sem passar pelo Mercado Pago pedem um
+  // segundo clique: 'manual' (confirmar pagamento) ou 'cancelar'
+  const [pixConfirmando, setPixConfirmando] = useState(null)
+  useEffect(() => setPixConfirmando(null), [currentPedido._id])
+
+  const handlePixAction = async (action) => {
+    if (isLoading) return
+    const result = await action(currentPedido)
+    setPixConfirmando(null)
+    if (result?.success) onClose()
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4">
+      {/* Backdrop */}
+      <div
+        className="absolute inset-0 bg-black/50"
+        onClick={onClose}
+        aria-hidden="true"
+      />
+
+      {/* Modal */}
+      <div
+        ref={modalRef}
+        className="relative flex h-[92vh] w-full max-w-6xl flex-col overflow-hidden rounded-3xl border border-white/60 bg-white shadow-2xl"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="modal-titulo"
+      >
+        {/* Header */}
+        <div className="shrink-0 border-b border-gray-200 bg-white px-5 py-4 lg:px-6">
+          <div className="flex items-center justify-between mb-3">
+            <div className="flex items-center gap-4">
+              <div
+                className="w-12 h-12 rounded-lg bg-[#7f22fe] flex items-center justify-center"
+                aria-hidden="true"
+              >
+                <i className="fas fa-receipt text-white"></i>
+              </div>
+              <div>
+                <h2
+                  id="modal-titulo"
+                  className="text-xl font-bold text-gray-900 flex items-center gap-3"
+                >
+                  Pedido #{getOrderNumber(currentPedido)}
+                  {minutes > 0 && (
+                    <span className="text-sm font-normal text-gray-600">
+                      ({minutes}min)
+                    </span>
+                  )}
+                </h2>
+                <span className="text-sm px-3 py-1 rounded-full bg-purple-100 text-[#7f22fe] font-medium">
+                  {currentPedido.status}
+                </span>
+              </div>
+            </div>
+            <button
+              onClick={onClose}
+              className="w-10 h-10 rounded-lg bg-gray-100 hover:bg-gray-200 transition-colors focus:outline-none focus:ring-2 focus:ring-gray-400/40"
+              aria-label="Fechar modal"
+              type="button"
+            >
+              <i className="fas fa-times" aria-hidden="true"></i>
+            </button>
+          </div>
+
+          {/* Navegação prev/next intra-cluster */}
+          {currentPedido.clusterId && clusterOrders.length > 1 && (
+            <div className="flex items-center gap-3 mt-3 p-3 rounded-lg bg-blue-50 border border-blue-200">
+              <button
+                onClick={goToPrev}
+                disabled={!hasPrev}
+                className={`flex items-center gap-2 px-4 py-2 rounded-lg font-bold text-sm transition-all focus:outline-none focus:ring-2 focus:ring-blue-400/40 ${
+                  hasPrev
+                    ? 'bg-blue-500 text-white hover:bg-blue-600'
+                    : 'bg-gray-200 text-gray-400 cursor-not-allowed'
+                }`}
+                aria-label="Pedido anterior do grupo"
+                type="button"
+              >
+                <i className="fas fa-chevron-left" aria-hidden="true"></i>
+                Anterior
+              </button>
+
+              <div className="flex-1 text-center">
+                <p className="text-sm font-bold text-blue-900">
+                  Pedido {currentIndexInCluster + 1} de {clusterOrders.length}
+                </p>
+                <p className="text-xs text-blue-700">do mesmo grupo</p>
+              </div>
+
+              <button
+                onClick={goToNext}
+                disabled={!hasNext}
+                className={`flex items-center gap-2 px-4 py-2 rounded-lg font-bold text-sm transition-all focus:outline-none focus:ring-2 focus:ring-blue-400/40 ${
+                  hasNext
+                    ? 'bg-blue-500 text-white hover:bg-blue-600'
+                    : 'bg-gray-200 text-gray-400 cursor-not-allowed'
+                }`}
+                aria-label="Próximo pedido do grupo"
+                type="button"
+              >
+                Próximo
+                <i className="fas fa-chevron-right" aria-hidden="true"></i>
+              </button>
+            </div>
+          )}
+        </div>
+
+        <div className="flex min-h-0 flex-1 flex-col overflow-y-auto lg:grid lg:grid-cols-[340px_minmax(0,1fr)] lg:overflow-hidden">
+          <aside className="order-2 flex flex-none flex-col border-t border-gray-200 bg-slate-50 lg:order-1 lg:min-h-0 lg:border-r lg:border-t-0">
+            <div className="flex-1 space-y-3 p-4 custom-scrollbar lg:overflow-y-auto">
+              <section className="rounded-2xl border border-gray-200 bg-white p-4 shadow-sm">
+                <div className="flex items-start gap-3">
+                  <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-violet-100 text-[#7f22fe]">
+                    <i className="fas fa-user" aria-hidden="true"></i>
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <p className="truncate font-bold text-gray-900">
+                      {currentPedido.cliente?.nome || 'Consumidor'}
+                    </p>
+                    <p className="text-xs text-gray-500">
+                      {currentPedido.cliente?.telefone || 'Telefone não informado'}
+                    </p>
+                  </div>
+                </div>
+                {currentPedido.cliente?.telefone && (
+                  <button
+                    onClick={handleWhatsApp}
+                    className="mt-3 flex w-full items-center justify-center gap-2 rounded-xl border border-emerald-200 bg-emerald-50 py-2 text-xs font-bold text-emerald-700 transition-colors hover:bg-emerald-100"
+                    type="button"
+                  >
+                    <i className="fab fa-whatsapp text-base" aria-hidden="true"></i>
+                    Conversar no WhatsApp
+                  </button>
+                )}
+              </section>
+
+              <section className="rounded-2xl border border-blue-200 bg-blue-50/70 p-4">
+                <h3 className="mb-2 flex items-center gap-2 text-xs font-black uppercase tracking-wide text-blue-900">
+                  <i className={`fas ${currentPedido.enderecoEntrega ? 'fa-location-dot' : 'fa-store'}`} aria-hidden="true"></i>
+                  {currentPedido.enderecoEntrega ? 'Entrega' : 'Retirada'}
+                </h3>
+                {currentPedido.enderecoEntrega ? (
+                  <>
+                    <p className="text-sm font-bold leading-snug text-gray-900">
+                      {currentPedido.enderecoEntrega.rua}, {currentPedido.enderecoEntrega.numero}
+                    </p>
+                    <p className="mt-0.5 text-xs text-gray-600">
+                      {currentPedido.enderecoEntrega.bairro}
+                      {currentPedido.enderecoEntrega.cidade
+                        ? ` · ${currentPedido.enderecoEntrega.cidade}`
+                        : ''}
+                    </p>
+                    <div className="mt-3 flex gap-2">
+                      <button
+                        onClick={openGoogleMaps}
+                        className="flex-1 rounded-lg bg-blue-600 px-3 py-2 text-xs font-bold text-white hover:bg-blue-700"
+                        type="button"
+                      >
+                        <i className="fas fa-map mr-1.5" aria-hidden="true"></i>
+                        Mapa
+                      </button>
+                      {currentPedido.clusterId && clusterOrders.length > 1 && (
+                        <button
+                          onClick={createClusterRoute}
+                          className="flex-1 rounded-lg border border-blue-300 bg-white px-3 py-2 text-xs font-bold text-blue-700 hover:bg-blue-100"
+                          type="button"
+                        >
+                          <i className="fas fa-route mr-1.5" aria-hidden="true"></i>
+                          Rota
+                        </button>
+                      )}
+                    </div>
+                  </>
+                ) : (
+                  <p className="text-sm font-bold text-gray-800">Retirada no balcão</p>
+                )}
+
+                {currentPedido.clusterId && currentPedido.clusterDistances?.length > 0 && (
+                  <div className="mt-3 border-t border-blue-200 pt-3">
+                    <p className="mb-2 text-[10px] font-black uppercase tracking-wide text-blue-800">
+                      Pedidos da rota
+                    </p>
+                    <div className="space-y-1.5">
+                      {currentPedido.clusterDistances.map((nearby) => (
+                        <button
+                          key={nearby.orderId}
+                          onClick={() => navigateToOrder(nearby.orderId)}
+                          className="flex w-full items-center justify-between gap-2 rounded-lg bg-white px-2.5 py-2 text-left text-blue-900 hover:bg-blue-100"
+                          type="button"
+                          aria-label={`Ver pedido #${nearby.orderNumber} a ${nearby.distance.toFixed(1)} km`}
+                        >
+                          <span className="min-w-0">
+                            <span className="block text-xs font-black">#{nearby.orderNumber}</span>
+                            <span className="block truncate text-[10px] font-medium text-blue-700">
+                              {nearby.address}
+                            </span>
+                          </span>
+                          <span className="shrink-0 text-xs font-bold">
+                            {nearby.distance.toFixed(1)} km
+                          </span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+              </section>
+
+              <section className="rounded-2xl border border-emerald-200 bg-white p-4 shadow-sm">
+                <div className="mb-3 flex items-center justify-between">
+                  <h3 className="flex items-center gap-2 text-xs font-black uppercase tracking-wide text-emerald-800">
+                    <i className="fas fa-wallet" aria-hidden="true"></i>
+                    Pagamento
+                  </h3>
+                  <span
+                    className={`rounded-full border px-2 py-1 text-[9px] font-black ${modalPaymentInfo.className}`}
+                    title={modalPaymentInfo.label}
+                  >
+                    {modalPaymentInfo.shortLabel || modalPaymentInfo.label}
+                  </span>
+                </div>
+                <div className="space-y-2 text-xs text-gray-600">
+                  <div className="flex justify-between">
+                    <span>Subtotal</span>
+                    <strong className="text-gray-800">{formatCurrency(currentPedido.subtotal)}</strong>
+                  </div>
+                  {currentPedido.taxaEntrega > 0 && (
+                    <div className="flex justify-between">
+                      <span>Taxa de entrega</span>
+                      <strong className="text-gray-800">{formatCurrency(currentPedido.taxaEntrega)}</strong>
+                    </div>
+                  )}
+                  {currentPedido.desconto > 0 && (
+                    <div className="rounded-lg bg-emerald-50 p-2 text-emerald-800">
+                      <div className="flex justify-between font-bold">
+                        <span>Desconto</span>
+                        <span>-{formatCurrency(currentPedido.desconto)}</span>
+                      </div>
+                      {discountInfo && <p className="mt-1 text-[10px]">{discountInfo.label}</p>}
+                    </div>
+                  )}
+                  <div className="flex items-end justify-between border-t border-gray-200 pt-3">
+                    <span className="font-bold text-gray-900">Total</span>
+                    <strong className="text-2xl leading-none text-[#7f22fe]">
+                      {formatCurrency(currentPedido.total)}
+                    </strong>
+                  </div>
+                  {currentPedido.trocoPara && (
+                    <div className="rounded-lg bg-blue-50 px-2.5 py-2 text-center font-bold text-blue-800">
+                      Troco para {formatCurrency(currentPedido.trocoPara)}
+                    </div>
+                  )}
+                </div>
+              </section>
+            </div>
+
+            <div className="shrink-0 border-t border-gray-200 bg-white p-4 shadow-[0_-8px_24px_rgba(15,23,42,0.06)]">
+              {currentPedido.status !== 'Entregue' && (
+                <div className={`mb-3 flex items-center gap-2 rounded-lg border px-3 py-2 text-[10px] font-bold ${printInfo.className}`}>
+                  <i className={`fas ${printInfo.icon}`} aria-hidden="true"></i>
+                  <span>{printInfo.label}</span>
+                  {printStatus?.lastPrintedAt && (
+                    <span className="ml-auto font-medium opacity-70">
+                      {formatTime(printStatus.lastPrintedAt)}
+                    </span>
+                  )}
+                </div>
+              )}
+              <div className="flex gap-2">
+                <button
+                  onClick={() => onPrint(currentPedido)}
+                  disabled={isLoading || printStatus?.status === 'printing'}
+                  className="flex-1 rounded-xl border border-gray-300 bg-white py-3 text-xs font-bold text-gray-700 hover:bg-gray-50 disabled:cursor-wait disabled:opacity-60"
+                  type="button"
+                >
+                  <i
+                    className={`fas ${
+                      printStatus?.status === 'printing'
+                        ? 'fa-spinner fa-spin'
+                        : printStatus?.status === 'failed'
+                        ? 'fa-rotate'
+                        : 'fa-print'
+                    } mr-1.5`}
+                    aria-hidden="true"
+                  ></i>
+                  {printStatus?.status === 'printing'
+                    ? 'Imprimindo...'
+                    : printStatus?.status === 'failed'
+                    ? 'Tentar'
+                    : 'Imprimir'}
+                </button>
+              </div>
+              {currentPedido.aguardandoPagamento && (
+                <div className="mt-2 space-y-2">
+                  <div
+                    className={`rounded-lg border px-3 py-2 text-[11px] font-medium ${
+                      currentPedido.pagamentoRecusado
+                        ? 'border-red-200 bg-red-50 text-red-800'
+                        : 'border-amber-200 bg-amber-50 text-amber-800'
+                    }`}
+                  >
+                    <p className="font-black">
+                      {currentPedido.pagamentoRecusado
+                        ? 'Pix recusado pelo Mercado Pago'
+                        : `Aguardando o Pix há ${minutes} min`}
+                    </p>
+                    <p>
+                      {currentPedido.pagamentoRecusado
+                        ? 'O cliente pode tentar pagar de novo. Não prepare antes de o pagamento ser aprovado.'
+                        : 'Não prepare ainda. O gestor confere o Mercado Pago a cada minuto e avisa quando o pagamento for aprovado.'}
+                    </p>
+                  </div>
+
+                  <button
+                    onClick={() => handlePixAction(onCheckPayment)}
+                    disabled={isLoading}
+                    className={`w-full rounded-xl py-3.5 text-sm font-black text-white transition-colors ${
+                      isLoading ? 'cursor-not-allowed bg-gray-400' : 'bg-[#7f22fe] hover:bg-[#6b1de0]'
+                    }`}
+                    type="button"
+                  >
+                    {isLoading ? (
+                      <i className="fas fa-spinner fa-spin" aria-hidden="true"></i>
+                    ) : (
+                      <>
+                        <i className="fas fa-rotate mr-2" aria-hidden="true"></i>
+                        Verificar pagamento no Mercado Pago
+                      </>
+                    )}
+                  </button>
+
+                  {pixConfirmando === 'manual' ? (
+                    <div className="rounded-xl border border-emerald-300 bg-emerald-50 p-3">
+                      <p className="mb-2 text-[11px] font-bold text-emerald-900">
+                        Só confirme se o valor de {formatCurrency(currentPedido.total)} já caiu na
+                        conta da pizzaria. O pedido vai direto para preparo.
+                      </p>
+                      <div className="flex gap-2">
+                        <button
+                          onClick={() => setPixConfirmando(null)}
+                          disabled={isLoading}
+                          className="flex-1 rounded-lg border border-gray-200 bg-white py-2 text-xs font-bold text-gray-700 hover:bg-gray-50"
+                          type="button"
+                        >
+                          Voltar
+                        </button>
+                        <button
+                          onClick={() => handlePixAction(onConfirmPayment)}
+                          disabled={isLoading}
+                          className="flex-1 rounded-lg bg-emerald-600 py-2 text-xs font-black text-white hover:bg-emerald-700 disabled:opacity-50"
+                          type="button"
+                        >
+                          Sim, já recebi
+                        </button>
+                      </div>
+                    </div>
+                  ) : pixConfirmando === 'cancelar' ? (
+                    <div className="rounded-xl border border-red-300 bg-red-50 p-3">
+                      <p className="mb-2 text-[11px] font-bold text-red-900">
+                        Cancelar o pedido #{getOrderNumber(currentPedido)}? Ele sai do gestor e do painel.
+                      </p>
+                      <div className="flex gap-2">
+                        <button
+                          onClick={() => setPixConfirmando(null)}
+                          disabled={isLoading}
+                          className="flex-1 rounded-lg border border-gray-200 bg-white py-2 text-xs font-bold text-gray-700 hover:bg-gray-50"
+                          type="button"
+                        >
+                          Voltar
+                        </button>
+                        <button
+                          onClick={() => handlePixAction(onCancelOrder)}
+                          disabled={isLoading}
+                          className="flex-1 rounded-lg bg-red-600 py-2 text-xs font-black text-white hover:bg-red-700 disabled:opacity-50"
+                          type="button"
+                        >
+                          Sim, cancelar
+                        </button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="flex gap-2">
+                      <button
+                        onClick={() => setPixConfirmando('manual')}
+                        disabled={isLoading}
+                        className="flex-1 rounded-xl border border-emerald-200 bg-emerald-50 py-2.5 text-xs font-bold text-emerald-700 hover:bg-emerald-100 disabled:opacity-50"
+                        type="button"
+                      >
+                        <i className="fas fa-circle-check mr-1.5" aria-hidden="true"></i>
+                        Confirmar manualmente
+                      </button>
+                      <button
+                        onClick={() => setPixConfirmando('cancelar')}
+                        disabled={isLoading}
+                        className="flex-1 rounded-xl border border-red-200 bg-red-50 py-2.5 text-xs font-bold text-red-700 hover:bg-red-100 disabled:opacity-50"
+                        type="button"
+                      >
+                        <i className="fas fa-ban mr-1.5" aria-hidden="true"></i>
+                        Cancelar pedido
+                      </button>
+                    </div>
+                  )}
+                </div>
+              )}
+              {getNextStatus(currentPedido.status) && (
+                <button
+                  onClick={handleAdvance}
+                  disabled={isLoading}
+                  className={`mt-2 w-full rounded-xl py-3.5 text-sm font-black text-white transition-colors ${
+                    isLoading ? 'cursor-not-allowed bg-gray-400' : 'bg-[#7f22fe] hover:bg-[#6b1de0]'
+                  }`}
+                  type="button"
+                  aria-label={isLoading ? orderAction?.loadingLabel : orderAction?.label}
+                >
+                  {isLoading ? (
+                    <i className="fas fa-spinner fa-spin" aria-hidden="true"></i>
+                  ) : (
+                    <>
+                      <i className={`fas ${orderAction?.icon || 'fa-arrow-right'} mr-2`} aria-hidden="true"></i>
+                      {orderAction?.label || 'Atualizar pedido'}
+                    </>
+                  )}
+                </button>
+              )}
+            </div>
+          </aside>
+
+          <section className="order-1 flex min-h-[45vh] flex-none flex-col bg-gray-50/70 lg:order-2 lg:min-h-0">
+            <div className="flex shrink-0 items-center justify-between border-b border-gray-200 bg-white px-5 py-3">
+              <div>
+                <h3 className="font-black text-gray-900">Itens do pedido</h3>
+                <p className="text-xs text-gray-500">
+                  {itemCount} {itemCount === 1 ? 'item' : 'itens'} em {(currentPedido.itens || []).length} {(currentPedido.itens || []).length === 1 ? 'produto' : 'produtos'}
+                </p>
+              </div>
+              {hasOrderObservation(currentPedido) && (
+                <span className="rounded-full border border-amber-300 bg-amber-100 px-3 py-1 text-[10px] font-black text-amber-900">
+                  <i className="fas fa-comment-dots mr-1.5" aria-hidden="true"></i>
+                  TEM OBSERVAÇÃO
+                </span>
+              )}
+            </div>
+            <div className="flex-1 space-y-3 p-4 custom-scrollbar lg:overflow-y-auto lg:p-5">
+              {currentPedido.horarioEntrega && (
+                <div className="flex items-center gap-2 rounded-2xl border border-indigo-200 bg-indigo-50 px-4 py-3 text-sm font-bold text-indigo-900">
+                  <i className="fas fa-calendar-check" aria-hidden="true"></i>
+                  <span>
+                    {isDelivery(currentPedido) ? 'Entrega' : 'Retirada'} agendada para{' '}
+                    {formatTime(currentPedido.horarioEntrega)}
+                    <span className="block text-xs font-semibold text-indigo-700">
+                      {aguardandoHorario
+                        ? `Começar o preparo às ${formatTime(getInicioContagem(currentPedido))} (${ANTECEDENCIA_PREPARO_MIN} min antes).`
+                        : 'Já está na hora do preparo.'}
+                    </span>
+                  </span>
+                </div>
+              )}
+              {currentPedido.observacao && (
+                <div className="rounded-2xl border border-amber-300 bg-amber-50 px-4 py-3 text-sm text-amber-900">
+                  <p className="mb-1 text-[10px] font-black uppercase tracking-wide">
+                    <i className="fas fa-comment-dots mr-1.5" aria-hidden="true"></i>
+                    Observação do cliente
+                  </p>
+                  <p className="font-semibold">{currentPedido.observacao}</p>
+                </div>
+              )}
+              <div className="space-y-3" role="list" aria-label="Itens do pedido">
+              {(currentPedido.itens || []).map((item, idx) => (
+                <article
+                  key={idx}
+                  className={`rounded-2xl border bg-white p-4 shadow-sm ${
+                    item.obs ? 'border-amber-300 ring-1 ring-amber-100' : 'border-gray-200'
+                  }`}
+                  role="listitem"
+                >
+                  <div className="flex items-start gap-4">
+                    <div className="flex h-11 w-11 shrink-0 items-center justify-center rounded-xl bg-[#7f22fe] text-sm font-black text-white shadow-sm">
+                      {item.quantidade}x
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-start justify-between gap-4">
+                        <p className="font-bold leading-snug text-gray-900">{item.nome}</p>
+                        <p className="shrink-0 font-black text-gray-900">
+                          {formatCurrency(item.precoUnitario * item.quantidade)}
+                        </p>
+                      </div>
+                      {item.complementos?.length > 0 && (
+                        <div className="mt-2 rounded-lg bg-gray-50 px-3 py-2 text-sm text-gray-600">
+                          {item.quantidade > 1 && (
+                            <span className="mr-1 text-[10px] font-black uppercase tracking-wide text-gray-400">
+                              Cada unidade:
+                            </span>
+                          )}
+                          + {item.complementos.join(', ')}
+                        </div>
+                      )}
+                      {item.obs && (
+                        <div className="mt-2 flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-100 px-3 py-2 text-sm font-bold text-amber-900">
+                          <i className="fas fa-comment-dots mt-0.5" aria-hidden="true"></i>
+                          <span>{item.obs}</span>
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </article>
+              ))}
+              </div>
+            </div>
+          </section>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ToastContainer — sistema de notificações com aria-live e barra de progresso real
+//
+// Melhorias vs original:
+// 1. aria-live="polite" + role="status" — leitores de tela anunciam cada toast
+// 2. Barra de progresso com valor real via setInterval (não CSS puro)
+//    → o operador vê exatamente quanto tempo ainda tem para ler
+// ─────────────────────────────────────────────────────────────────────────────
+
+function Toast({ toast, onDismiss }) {
+  const [progress, setProgress] = useState(100)
+  const [actionLoading, setActionLoading] = useState(false)
+  const [isPaused, setIsPaused] = useState(false)
+
+  // Tempo restante em ms — sobrevive a pausas do hover, decrementado pelo
+  // tempo real decorrido a cada tick (não por uma contagem fixa de ticks).
+  const remainingRef = useRef(toast.duration || 6000)
+  const lastTickRef = useRef(Date.now())
+
+  useEffect(() => {
+    if (isPaused) return
+
+    const totalDuration = toast.duration || 6000
+    lastTickRef.current = Date.now()
+
+    const id = setInterval(() => {
+      const now = Date.now()
+      remainingRef.current = Math.max(0, remainingRef.current - (now - lastTickRef.current))
+      lastTickRef.current = now
+      setProgress(Math.max(0, (remainingRef.current / totalDuration) * 100))
+
+      if (remainingRef.current <= 0) {
+        clearInterval(id)
+        onDismiss(toast.id)
+      }
+    }, 50)
+
+    return () => clearInterval(id)
+  }, [isPaused, toast.duration, toast.id, onDismiss])
+
+  const styles = {
+    success: { bar: 'bg-emerald-500', box: 'bg-white border-emerald-300 text-emerald-900', icon: 'fa-check-circle text-emerald-500' },
+    error:   { bar: 'bg-red-500',     box: 'bg-white border-red-300 text-red-900',         icon: 'fa-times-circle text-red-500' },
+    warning: { bar: 'bg-yellow-400',  box: 'bg-white border-yellow-300 text-yellow-900',   icon: 'fa-exclamation-triangle text-yellow-500' },
+    info:    { bar: 'bg-blue-500',    box: 'bg-white border-blue-300 text-blue-900',        icon: 'fa-info-circle text-blue-500' },
+  }
+  const s = styles[toast.type] || styles.info
+
+  const handleAction = async () => {
+    if (!toast.action?.onClick || actionLoading) return
+    setActionLoading(true)
+    try {
+      const completed = await toast.action.onClick()
+      if (completed !== false) onDismiss(toast.id)
+    } finally {
+      setActionLoading(false)
+    }
+  }
+
+  return (
+    <div
+      onMouseEnter={() => setIsPaused(true)}
+      onMouseLeave={() => setIsPaused(false)}
+      className={`relative overflow-hidden flex items-start gap-3 p-4 rounded-xl border shadow-xl text-sm font-medium ${s.box}`}
+    >
+      <i className={`fas ${s.icon} mt-0.5 shrink-0 text-base`} aria-hidden="true"></i>
+      <span className="flex-1 leading-relaxed">{toast.message}</span>
+      {toast.action && (
+        <button
+          type="button"
+          onClick={handleAction}
+          disabled={actionLoading}
+          className="shrink-0 rounded-lg border border-current/30 px-3 py-1.5 text-xs font-black hover:bg-black/5 disabled:opacity-50"
+        >
+          {actionLoading ? (
+            <i className="fas fa-spinner fa-spin" aria-label="Processando"></i>
+          ) : (
+            toast.action.label
+          )}
+        </button>
+      )}
+      {/* Barra de progresso com valor real — não é apenas animação CSS */}
+      <div
+        className={`absolute bottom-0 left-0 h-1 rounded-b-xl transition-none ${s.bar}`}
+        style={{ width: `${progress}%` }}
+        role="progressbar"
+        aria-valuenow={Math.round(progress)}
+        aria-valuemin={0}
+        aria-valuemax={100}
+      />
+    </div>
+  )
+}
+
+function ToastContainer({ toasts, onDismiss }) {
+  return (
+    <div
+      className="fixed bottom-5 right-5 z-[200] flex flex-col gap-3 max-w-sm pointer-events-none"
+      aria-live="polite"
+      aria-atomic="false"
+      role="status"
+    >
+      {toasts.map(toast => (
+        <div key={toast.id} className="pointer-events-auto">
+          <Toast toast={toast} onDismiss={onDismiss} />
+        </div>
+      ))}
+    </div>
+  )
+}
+
+function OperationalAlertsBar({ alerts }) {
+  if (!alerts.length) return null
+
+  const styles = {
+    critical: 'bg-red-50 border-red-200 text-red-800 hover:bg-red-100',
+    warning: 'bg-amber-50 border-amber-200 text-amber-800 hover:bg-amber-100',
+    info: 'bg-blue-50 border-blue-200 text-blue-800 hover:bg-blue-100',
+  }
+
+  return (
+    <div className="border-t border-gray-100 bg-gray-50/80 px-4 py-2" role="status" aria-live="polite">
+      <div className="flex items-center gap-2 overflow-x-auto pb-0.5">
+        <span className="hidden sm:inline-flex items-center gap-1.5 text-[11px] font-black uppercase tracking-wide text-gray-500 shrink-0">
+          <i className="fas fa-triangle-exclamation" aria-hidden="true" />
+          Operação
+        </span>
+        {alerts.map((alert) => {
+          const content = (
+            <>
+              <i className={`${alert.icon.includes('fa-brands') ? alert.icon : `fas ${alert.icon}`} text-xs`} aria-hidden="true" />
+              <span className="font-black whitespace-nowrap">{alert.label}</span>
+              {alert.detail && (
+                <span className="hidden md:inline max-w-[220px] truncate opacity-80">{alert.detail}</span>
+              )}
+            </>
+          )
+
+          const className = `inline-flex items-center gap-2 rounded-md border px-2.5 py-1.5 text-xs transition-colors shrink-0 ${styles[alert.severity] || styles.info}`
+
+          return alert.onClick ? (
+            <button key={alert.id} type="button" onClick={alert.onClick} className={className}>
+              {content}
+            </button>
+          ) : (
+            <div key={alert.id} className={className}>
+              {content}
+            </div>
+          )
+        })}
+      </div>
+    </div>
+  )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ElectronBanner — aviso quando o gestor está rodando no navegador
+// ─────────────────────────────────────────────────────────────────────────────
+
+function ElectronBanner() {
+  const [dismissed, setDismissed] = useState(false)
+  const [downloadUrl, setDownloadUrl] = useState('https://github.com/nadingarcia/gestor-casamia/releases/latest')
+
+  useEffect(() => {
+    fetch('https://api.github.com/repos/nadingarcia/gestor-casamia/releases/latest')
+      .then(r => r.json())
+      .then(data => {
+        const exe = data.assets?.find(a => a.name.endsWith('.exe'))
+        if (exe) setDownloadUrl(exe.browser_download_url)
+      })
+      .catch(() => {}) // fallback já está no estado inicial
+  }, [])
+
+  if (electronAPI.isElectron() || dismissed) return null
+
+  return (
+    <div
+      className="fixed bottom-5 left-5 z-[200] max-w-sm w-full bg-white border-2 border-[#7f22fe] rounded-2xl shadow-2xl overflow-hidden"
+      role="alert"
+      aria-live="polite"
+    >
+      <div className="bg-[#7f22fe] px-4 py-2 flex items-center justify-between">
+        <div className="flex items-center gap-2 text-white font-bold text-sm">
+          <i className="fas fa-bolt" aria-hidden="true"></i>
+          Gestor de Pedidos — Versão Desktop
+        </div>
+        <button
+          onClick={() => setDismissed(true)}
+          className="text-white/70 hover:text-white transition-colors"
+          aria-label="Fechar aviso"
+          type="button"
+        >
+          <i className="fas fa-times text-sm" aria-hidden="true"></i>
+        </button>
+      </div>
+
+      <div className="p-4 space-y-3">
+        <p className="text-sm text-gray-700 font-medium leading-relaxed">
+          Você está usando o Gestor no navegador.{' '}
+          <strong className="text-gray-900">Algumas funcionalidades estão indisponíveis:</strong>
+        </p>
+
+        <ul className="space-y-1.5 text-sm text-gray-600">
+          {[
+            ['fa-print',     'Impressão automática na térmica'],
+            ['fa-bell',      'Notificações nativas do sistema'],
+            ['fa-plug',      'Bloqueio de suspensão do PC'],
+          ].map(([icon, label]) => (
+            <li key={label} className="flex items-center gap-2">
+              <span className="w-5 h-5 rounded-full bg-red-100 flex items-center justify-center shrink-0">
+                <i className={`fas ${icon} text-red-500 text-[10px]`} aria-hidden="true"></i>
+              </span>
+              <span>{label}</span>
+            </li>
+          ))}
+        </ul>
+
+        <div className="pt-1 border-t border-gray-100">
+          <p className="text-xs text-gray-500 mb-2">
+            Baixe o app desktop para ter a experiência completa:
+          </p>
+          <a
+            href={downloadUrl}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="flex items-center justify-center gap-2 w-full py-2.5 bg-[#7f22fe] hover:bg-[#6b1de0] text-white rounded-lg font-bold text-sm transition-colors focus:outline-none focus:ring-2 focus:ring-[#7f22fe]/40"
+          >
+            <i className="fas fa-download" aria-hidden="true"></i>
+            Baixar Gestor Casa Mia (.exe)
+          </a>
+
+          {/* Aviso SmartScreen */}
+          <p className="text-[11px] text-gray-400 text-center mt-2 leading-relaxed">
+            <i className="fas fa-shield-alt mr-1"></i>
+            Se o Windows exibir um aviso de segurança, clique em{' '}
+            <strong className="text-gray-500">"Mais informações"</strong> e depois em{' '}
+            <strong className="text-gray-500">"Executar mesmo assim"</strong>.
+          </p>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function AccordionSection({ id, icon, title, defaultOpen = false, children }) {
+  const [open, setOpen] = useState(defaultOpen)
+
+  return (
+    <div className="rounded-xl border border-gray-200 overflow-hidden">
+      <button
+        type="button"
+        onClick={() => setOpen(!open)}
+        className="w-full flex items-center justify-between px-4 py-3.5 bg-gray-50 hover:bg-gray-100 transition-colors focus:outline-none focus:ring-2 focus:ring-inset focus:ring-[#7f22fe]/30"
+        aria-expanded={open}
+        aria-controls={id}
+      >
+        <span className="flex items-center gap-2 text-sm font-bold text-gray-600 uppercase tracking-wider">
+          <i className={`fas fa-${icon} text-gray-400`} aria-hidden="true"></i>
+          {title}
+        </span>
+        <i
+          className={`fas fa-chevron-down text-gray-400 text-xs transition-transform duration-200 ${open ? 'rotate-180' : ''}`}
+          aria-hidden="true"
+        />
+      </button>
+
+      {open && (
+        <div id={id} className="p-4 space-y-4 bg-white border-t border-gray-100">
+          {children}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function LogoutConfirmModal({ onConfirm, onClose }) {
+  const trapRef = useFocusTrap(true, onClose)
+
+  return (
+    <div className="fixed inset-0 z-[70] flex items-center justify-center p-4">
+      <div className="absolute inset-0 bg-black/60" onClick={onClose} aria-hidden="true" />
+
+      <div
+        ref={trapRef}
+        className="relative w-full max-w-md overflow-hidden rounded-2xl bg-white shadow-2xl"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="logout-modal-title"
+      >
+        <div className="border-b border-gray-200 px-5 py-4">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-red-50 text-red-600">
+                <i className="fas fa-right-from-bracket" aria-hidden="true"></i>
+              </div>
+              <div>
+                <h3 id="logout-modal-title" className="text-base font-bold text-gray-900">
+                  Encerrar sessão?
+                </h3>
+                <p className="text-xs font-medium text-gray-500">
+                  Você precisará fazer login novamente para voltar ao gestor.
+                </p>
+              </div>
+            </div>
+            <button
+              onClick={onClose}
+              className="rounded-lg p-2 text-gray-400 hover:bg-gray-100 hover:text-gray-600 focus:outline-none focus:ring-2 focus:ring-gray-400/40"
+              aria-label="Cancelar encerramento de sessão"
+              type="button"
+            >
+              <i className="fas fa-times" aria-hidden="true"></i>
+            </button>
+          </div>
+        </div>
+
+        <div className="space-y-4 p-5">
+          <p className="text-sm leading-relaxed text-gray-600">
+            Os pedidos deixam de sincronizar nesta tela assim que a sessão for encerrada.
+          </p>
+
+          <div className="rounded-lg border border-red-200 bg-red-50 p-3 text-xs font-medium text-red-700">
+            Confirme apenas se realmente deseja sair da conta atual.
+          </div>
+        </div>
+
+        <div className="flex gap-3 border-t border-gray-200 px-5 py-4">
+          <button
+            onClick={onClose}
+            className="flex-1 rounded-xl border border-gray-300 bg-white py-3 text-sm font-bold text-gray-700 hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-gray-400/40"
+            type="button"
+          >
+            Cancelar
+          </button>
+          <button
+            onClick={onConfirm}
+            className="flex-[1.4] rounded-xl bg-red-600 py-3 text-sm font-black text-white transition-colors hover:bg-red-700 focus:outline-none focus:ring-2 focus:ring-red-500/40"
+            type="button"
+          >
+            Encerrar sessão
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function ClearLocalDataModal({ onConfirm, onClose }) {
+  const trapRef = useFocusTrap(true, onClose)
+
+  return (
+    <div className="fixed inset-0 z-[70] flex items-center justify-center p-4">
+      <div className="absolute inset-0 bg-black/60" onClick={onClose} aria-hidden="true" />
+
+      <div
+        ref={trapRef}
+        className="relative w-full max-w-md overflow-hidden rounded-2xl bg-white shadow-2xl"
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby="clear-data-modal-title"
+      >
+        <div className="border-b border-gray-200 px-5 py-4">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <div className="flex h-10 w-10 items-center justify-center rounded-lg bg-amber-50 text-amber-600">
+                <i className="fas fa-broom" aria-hidden="true"></i>
+              </div>
+              <div>
+                <h3 id="clear-data-modal-title" className="text-base font-bold text-gray-900">
+                  Limpar cache e dados locais?
+                </h3>
+                <p className="text-xs font-medium text-gray-500">
+                  Esta ação limpa as preferências salvas neste computador.
+                </p>
+              </div>
+            </div>
+            <button
+              onClick={onClose}
+              className="rounded-lg p-2 text-gray-400 hover:bg-gray-100 hover:text-gray-600 focus:outline-none focus:ring-2 focus:ring-gray-400/40"
+              aria-label="Cancelar limpeza de dados locais"
+              type="button"
+            >
+              <i className="fas fa-times" aria-hidden="true"></i>
+            </button>
+          </div>
+        </div>
+
+        <div className="space-y-4 p-5">
+          <p className="text-sm leading-relaxed text-gray-600">
+            Isso apaga sessão, cache de pedidos, impressora escolhida, filtros e outras configurações locais. Depois será necessário fazer login novamente.
+          </p>
+
+          <div className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-xs font-medium text-amber-800">
+            Use quando o gestor estiver com dados antigos, configuração travada ou comportamento estranho.
+          </div>
+        </div>
+
+        <div className="flex gap-3 border-t border-gray-200 px-5 py-4">
+          <button
+            onClick={onClose}
+            className="flex-1 rounded-xl border border-gray-300 bg-white py-3 text-sm font-bold text-gray-700 hover:bg-gray-50 focus:outline-none focus:ring-2 focus:ring-gray-400/40"
+            type="button"
+          >
+            Cancelar
+          </button>
+          <button
+            onClick={onConfirm}
+            className="flex-[1.4] rounded-xl bg-amber-600 py-3 text-sm font-black text-white transition-colors hover:bg-amber-700 focus:outline-none focus:ring-2 focus:ring-amber-500/40"
+            type="button"
+          >
+            Limpar dados
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PixPendingMenu — Pix online que ainda não virou pedido de verdade. Ficam
+// fora do Kanban (não pode preparar), então a lista é o único lugar onde
+// aparecem todos.
+// ─────────────────────────────────────────────────────────────────────────────
+
+function PixPendingMenu({ pendentes, recusados, onSelect }) {
+  const [open, setOpen] = useState(false)
+  const now = useTick()
+  const containerRef = useRef(null)
+
+  useEffect(() => {
+    if (!open) return
+    const handleClickOutside = (e) => {
+      if (!containerRef.current?.contains(e.target)) setOpen(false)
+    }
+    const handleEscape = (e) => {
+      if (e.key === 'Escape') setOpen(false)
+    }
+    document.addEventListener('mousedown', handleClickOutside)
+    document.addEventListener('keydown', handleEscape)
+    return () => {
+      document.removeEventListener('mousedown', handleClickOutside)
+      document.removeEventListener('keydown', handleEscape)
+    }
+  }, [open])
+
+  const total = pendentes.length + recusados.length
+  if (total === 0) return null
+
+  const temRecusado = recusados.length > 0
+  const itens = [...recusados, ...pendentes]
+
+  return (
+    <div ref={containerRef} className="relative hidden md:block">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className={`flex items-center gap-2 px-3 py-2 rounded-lg transition-colors ${
+          temRecusado
+            ? 'bg-red-50 border-2 border-red-300 text-red-700 hover:bg-red-100 animate-pulse'
+            : 'bg-yellow-50 border border-yellow-200 text-yellow-700 hover:bg-yellow-100'
+        }`}
+        aria-haspopup="true"
+        aria-expanded={open}
+        aria-label={`${total} Pix online aguardando. Clique para ver.`}
+        type="button"
+      >
+        <i
+          className={`fas ${temRecusado ? 'fa-exclamation-triangle' : 'fa-clock'}`}
+          aria-hidden="true"
+        ></i>
+        <span className="text-sm font-bold">
+          {pendentes.length > 0 && `${pendentes.length} Pix Pendente`}
+          {pendentes.length > 0 && temRecusado && ' · '}
+          {temRecusado && `${recusados.length} Recusado`}
+        </span>
+        <i className="fas fa-chevron-down text-[10px]" aria-hidden="true"></i>
+      </button>
+
+      {open && (
+        <div
+          className="absolute right-0 top-full z-40 mt-2 w-80 overflow-hidden rounded-xl border border-gray-200 bg-white shadow-xl"
+          role="menu"
+        >
+          <p className="border-b border-gray-100 px-4 py-2 text-[11px] font-medium text-gray-500">
+            Pix online ainda não pago. Não prepare antes da aprovação.
+          </p>
+          <ul className="max-h-80 overflow-y-auto">
+            {itens.map((p) => {
+              const recusado = p.pagamentoRecusado
+              const { minutes } = getTimeElapsed(p.createdAt, now)
+              return (
+                <li key={p._id}>
+                  <button
+                    onClick={() => {
+                      setOpen(false)
+                      onSelect(p)
+                    }}
+                    className="flex w-full items-center gap-3 px-4 py-2.5 text-left hover:bg-gray-50"
+                    role="menuitem"
+                    type="button"
+                  >
+                    <span className="text-sm font-black text-gray-900">#{getOrderNumber(p)}</span>
+                    <span className="min-w-0 flex-1">
+                      <span className="block truncate text-sm font-bold text-gray-800">
+                        {p.cliente?.nome || 'Consumidor'}
+                      </span>
+                      <span className="block text-[11px] text-gray-500">
+                        {formatCurrency(p.total)}
+                        {isAgendado(p) && ` · agendado ${formatTime(p.horarioEntrega)}`}
+                      </span>
+                    </span>
+                    <span
+                      className={`shrink-0 rounded px-1.5 py-0.5 text-[10px] font-black ${
+                        recusado ? 'bg-red-100 text-red-700' : 'bg-yellow-100 text-yellow-800'
+                      }`}
+                    >
+                      {recusado ? 'RECUSADO' : `${minutes} min`}
+                    </span>
+                  </button>
+                </li>
+              )
+            })}
+          </ul>
+        </div>
+      )}
+    </div>
+  )
+}
